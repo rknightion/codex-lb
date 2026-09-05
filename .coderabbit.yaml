@@ -1,0 +1,33 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# Product-specific additions to the central CodeRabbit defaults.
+# Keep inheritance enabled; shared review policy lives in the owner/coderabbit repository.
+inheritance: true
+reviews:
+  path_instructions:
+  - path: app/core/**
+    instructions: >-
+      Trace proxy, bridge, websocket, scheduler, auth, and session-lifecycle changes end to end. File-pinned
+      requests must not cross accounts; reservations must settle before error-health writes; excluded
+      accounts must leave selection; idle disconnects must not poison healthy accounts; trusted-access
+      routing may degrade only along documented paths. Ensure spawned tasks are bounded, owned, cancelled
+      or awaited on every partial-failure path, and never share one AsyncSession across concurrent tasks.
+      For externally visible routes, headers, error envelopes, settings, and trailing-slash behaviour,
+      require compatibility coverage and the owning OpenSpec change when behaviour changes.
+  - path: app/db/**
+    instructions: >-
+      For schema changes, verify the Alembic revision points at the intended current parent and preserves
+      a single-head upgrade path. Check upgrade/downgrade expectations, historical-row backfill or compatibility
+      handling, SQLite and PostgreSQL behaviour, migration locking, and partial-failure recovery. Require
+      the owning OpenSpec artifact for behavioural or schema contract changes.
+  - path: crates/**
+    instructions: >-
+      Review the Rust egress and protocol crates as part of the same proxy contract: preserve request/account
+      affinity, cancellation, framing, websocket and HTTP compatibility, and bounded buffering. Unsafe
+      code is forbidden by the workspace. Check that changes remain compatible with Python callers and
+      do not bypass settlement or trusted-routing invariants.
+knowledge_base:
+  linked_repositories:
+  - repository: rknightion/codexlb2otel
+    instructions: >-
+      Direct consumer. Check changed published interfaces and formats against the consumer-pinned version
+      and its actual use; identify the consumer update needed before changing a released contract.
