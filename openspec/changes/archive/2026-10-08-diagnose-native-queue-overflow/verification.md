@@ -22,3 +22,8 @@ Queued bytes are payload accounting, not heap use. Websocket bytes count UTF-8 t
 - OpenSpec 1.13.1: all 67 main specs pass after synchronization.
 - Dashboard codex-lb-runtime-full published in m7kni codexlb2otel, covers 71 families; 90 live sample names mapped without gaps. All 110 target queries returned success, 63 had data before queue deployment. Two visual renders inspected and corrected. Unknown/not-yet-emitted metrics remain no-data.
 - Existing absent-Prometheus test fixture now blocks import_module via sys.modules; its assertions and intended behavior are unchanged.
+
+- CodeRabbit completed with zero findings, all five changed code/test files covered.
+- Camden updater exited zero deploying b04c0425f3fc7d395b64643e7d0f1fb8ae046b11. Healthy, migration policy OK, no schema drift. Three running source hashes match candidate. Metrics endpoint exposes HELP for all six queue families.
+- Initial post-deploy Loki12:35:30–12:36:30UTC query had no terminal observations; Mimir had no queue samples yet. Production event-to-Mimir proof remains pending a natural overflow; subprocess-to-registry path is verified locally.
+- No queue sizing, retry behavior or account penalty changes; no upstream publication.
