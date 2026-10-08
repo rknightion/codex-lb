@@ -29,6 +29,7 @@ from websockets.exceptions import ConnectionClosedError
 from websockets.frames import Close
 
 from app.core.auth.refresh import RefreshError
+from app.core.clients.native_egress import NativeEgressTransportError
 from app.core.clients.proxy import (
     CODEX_RESPONSES_LITE_WEBSOCKET_METADATA_KEY,
     ProxyResponseError,
@@ -37,6 +38,7 @@ from app.core.clients.proxy import (
 from app.core.clients.proxy_websocket import (
     UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE,
     CodexUpstreamWebSocket,
+    NativeUpstreamWebSocket,
     UpstreamWebSocket,
     UpstreamWebSocketMessage,
     UpstreamWebSocketTransportError,
@@ -31162,10 +31164,10 @@ async def test_http_bridge_reader_exception_captures_attempt_before_lifecycle_wa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("routed", [False, True], ids=["direct-close", "routed-receive-error"])
+@pytest.mark.parametrize("transport", ["direct", "routed", "native"])
 async def test_http_bridge_reader_maps_ordinary_websocket_receive_failure_to_stream_incomplete(
     monkeypatch: pytest.MonkeyPatch,
-    routed: bool,
+    transport: str,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
 
@@ -31183,12 +31185,18 @@ async def test_http_bridge_reader_maps_ordinary_websocket_receive_failure_to_str
         async def close(self) -> None:
             return None
 
+    class _NativeReceiveFailureWebSocket:
+        async def receive(self) -> None:
+            raise NativeEgressTransportError("private upstream detail", failure_phase="transport")
+
     session = _make_bridge_session(key_value="bridge-ordinary-close")
     session.upstream = (
         CodexUpstreamWebSocket(_RoutedReceiveFailureWebSocket())
-        if routed
+        if transport == "routed"
         else WebsocketsUpstreamWebSocket(cast(Any, _OrdinaryCloseConnection()))
     )
+    if transport == "native":
+        session.upstream = NativeUpstreamWebSocket(cast(Any, _NativeReceiveFailureWebSocket()))
     monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
     monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", AsyncMock(return_value=False))
     failure_calls: list[dict[str, object]] = []
@@ -31206,11 +31214,11 @@ async def test_http_bridge_reader_maps_ordinary_websocket_receive_failure_to_str
 
     await service._relay_http_bridge_upstream_messages(session)
 
-    assert session.last_upstream_close_code == (None if routed else 1011)
+    assert session.last_upstream_close_code == (1011 if transport == "direct" else None)
     assert len(failure_calls) == 1
     assert failure_calls[0]["error_code"] == "stream_incomplete"
     assert failure_calls[0]["response_events_seen"] == 0
-    if routed:
+    if transport != "direct":
         # Intentional flip for issue #1754: an abrupt drop with no close frame
         # and zero response events must stay account-neutral instead of
         # feeding error backoff and stranding continuity-bound follow-ups.
@@ -31225,6 +31233,12 @@ async def test_http_bridge_reader_maps_ordinary_websocket_receive_failure_to_str
         assert failure_calls[0]["account_neutral_transport_drop"] is False
         assert failure_calls[0]["upstream_close_code"] == 1011
         assert failure_calls[0]["transport_classification"] == "websocket_close_transient"
+
+    if transport == "native":
+        assert isinstance(session.upstream, NativeUpstreamWebSocket)
+        assert failure_calls[0]["diagnostic_connection_id"] == session.upstream.diagnostic_connection_id
+    else:
+        assert failure_calls[0]["diagnostic_connection_id"] is None
 
 
 @pytest.mark.asyncio

@@ -1735,6 +1735,7 @@ class _HTTPBridgeUpstreamEventsMixin:
         upstream_close_code: int | None = None,
         response_events_seen: int | None = None,
         transport_classification: str | None = None,
+        diagnostic_connection_id: str | None = None,
         retry_circuit_attempt_selection: _HTTPBridgeRetryCircuitAttemptSelection | None = None,
         account_neutral_transport_drop: bool = False,
     ) -> bool:
@@ -1786,6 +1787,7 @@ class _HTTPBridgeUpstreamEventsMixin:
             error_message=_truncate_identifier(error_message),
             upstream_close_code=observed_close_code,
             response_events_seen=observed_response_events,
+            diagnostic_connection_id=diagnostic_connection_id,
             transport_classification=transport_classification
             or (
                 f"websocket_close_{close_classification}"
@@ -2392,6 +2394,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                         error_code=message.error_code or "stream_incomplete",
                         error_message=_upstream_websocket_disconnect_message(message),
                         upstream_close_code=message.close_code,
+                        diagnostic_connection_id=message.diagnostic_connection_id,
                         response_events_seen=response_events_seen,
                         transport_classification=(
                             f"websocket_close_{close_classification}"

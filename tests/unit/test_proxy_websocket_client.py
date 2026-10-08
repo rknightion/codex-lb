@@ -2375,3 +2375,72 @@ async def test_live_connector_preserves_version_specific_alpha_without_synthesis
     assert lowered.get("openai-alpha") == supplied_alpha
     assert "openai-beta" not in lowered
     assert "sec-websocket-protocol" not in lowered
+
+
+@pytest.mark.asyncio
+async def test_native_failure_diagnostic_is_content_free_and_logged_once(caplog) -> None:
+    from app.core.clients.native_egress import _websocket_error_from_event
+
+    secret = "Bearer secret-example https://peer/private?token=secret payload"
+    failure = _websocket_error_from_event(
+        {
+            "message": secret,
+            "failure_phase": secret,
+            "diagnostic": {
+                "category": secret,
+                "protocol": [secret],
+                "io_kind": secret,
+                "os_code": True,
+                "tls": secret,
+                "operation": secret,
+            },
+        }
+    )
+
+    class NativeConnection(_FakeNativeWebSocket):
+        async def receive(self) -> NativeWebSocketMessage:
+            raise failure
+
+    websocket = NativeUpstreamWebSocket(cast(Any, NativeConnection()))
+    with caplog.at_level("WARNING"):
+        first = await websocket.receive()
+        await websocket.receive()
+    assert first.error == "Upstream websocket receive failed"
+    records = [record.message for record in caplog.records if "native_websocket_terminal" in record.message]
+    assert len(records) == 1
+    assert secret not in records[0]
+    assert "category=unknown" in records[0]
+    assert "phase=unknown" in records[0]
+    assert "os_code=None" in records[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["send", "receive"])
+async def test_native_diagnostic_handler_failure_preserves_transport_outcome(operation: str) -> None:
+    import logging
+
+    class BrokenHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            raise RuntimeError("diagnostic sink unavailable")
+
+    class NativeConnection(_FakeNativeWebSocket):
+        async def receive(self) -> NativeWebSocketMessage:
+            raise NativeEgressTransportError("private failure", failure_phase="transport")
+
+        async def send_text(self, text: str) -> None:
+            raise NativeEgressTransportError("private failure", failure_phase="transport")
+
+    logger = logging.getLogger("app.core.clients.proxy_websocket")
+    handler = BrokenHandler()
+    logger.addHandler(handler)
+    try:
+        socket = NativeUpstreamWebSocket(cast(Any, NativeConnection()))
+        if operation == "receive":
+            result = await socket.receive()
+            assert result.kind == "error"
+            assert result.error == "Upstream websocket receive failed"
+        else:
+            with pytest.raises(UpstreamWebSocketTransportError, match="Upstream websocket send failed"):
+                await socket.send_text("private request")
+    finally:
+        logger.removeHandler(handler)

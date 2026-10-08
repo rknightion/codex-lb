@@ -126,6 +126,10 @@ def _new_stream_queue() -> _BoundedEventQueue:
 class NativeEgressError(Exception):
     """Base error for the optional native Codex egress boundary."""
 
+    diagnostic_origin: str = "unknown"
+    helper_returncode_before_cleanup: int | None = None
+    helper_cleanup_requested: bool | None = None
+
 
 class NativeEgressUnavailable(NativeEgressError):
     """Raised when the optional native helper is not installed."""
@@ -133,6 +137,66 @@ class NativeEgressUnavailable(NativeEgressError):
 
 class NativeEgressProtocolError(NativeEgressError):
     """Raised when the helper violates the framed stream contract."""
+
+    def __init__(self, message: str, *, diagnostic_origin: str = "helper_protocol") -> None:
+        super().__init__(message)
+        self.diagnostic_origin = diagnostic_origin
+
+
+@dataclass(frozen=True, slots=True)
+class NativeWebSocketDiagnostic:
+    category: str = "unknown"
+    operation: str = "unknown"
+    protocol: str = "unknown"
+    io_kind: str = "unknown"
+    os_code: int | None = None
+    tls: str = "unknown"
+
+
+_DIAGNOSTIC_CATEGORIES = frozenset(
+    (
+        "unknown connection_closed already_closed io tls protocol capacity write_buffer_full utf8 "
+        "attack_attempt url http http_format timeout liveness_timeout "
+    ).split()
+)
+_DIAGNOSTIC_OPERATIONS = frozenset(("unknown connect receive send close ping pong pong_wait helper_write ").split())
+_DIAGNOSTIC_PROTOCOLS = frozenset(
+    (
+        "WrongHttpMethod WrongHttpVersion MissingConnectionUpgradeHeader MissingUpgradeWebSocketHeader "
+        "MissingSecWebSocketVersionHeader MissingSecWebSocketKey SecWebSocketAcceptKeyMismatch "
+        "SecWebSocketSubProtocolError InvalidExtensionsHeader JunkAfterRequest CustomResponseSuccessful "
+        "InvalidHeader HandshakeIncomplete HttparseError SendAfterClosing ReceivedAfterClosing "
+        "NonZeroReservedBits UnmaskedFrameFromClient MaskedFrameFromServer FragmentedControlFrame "
+        "CompressedControlFrame ControlFrameTooBig UnknownControlFrameType UnknownDataFrameType "
+        "UnexpectedContinueFrame CompressedContinueFrame ExpectedFragment ResetWithoutClosingHandshake "
+        "InvalidOpcode InvalidCloseSequence CompressionFailure "
+    ).split()
+)
+_DIAGNOSTIC_IO_KINDS = frozenset(
+    (
+        "connection_reset connection_aborted connection_refused broken_pipe not_connected timed_out "
+        "unexpected_eof would_block interrupted invalid_data permission_denied other unclassified "
+    ).split()
+)
+_DIAGNOSTIC_TLS = frozenset(("invalid_dns_name invalid_certificate alert_received rustls_other other ").split())
+
+
+def _diagnostic_label(value: object, allowed: frozenset[str]) -> str:
+    return value if isinstance(value, str) and value in allowed else "unknown"
+
+
+def _websocket_diagnostic(value: object) -> NativeWebSocketDiagnostic:
+    if not isinstance(value, dict):
+        return NativeWebSocketDiagnostic()
+    os_code = value.get("os_code")
+    return NativeWebSocketDiagnostic(
+        category=_diagnostic_label(value.get("category"), _DIAGNOSTIC_CATEGORIES),
+        operation=_diagnostic_label(value.get("operation"), _DIAGNOSTIC_OPERATIONS),
+        protocol=_diagnostic_label(value.get("protocol"), _DIAGNOSTIC_PROTOCOLS),
+        io_kind=_diagnostic_label(value.get("io_kind"), _DIAGNOSTIC_IO_KINDS),
+        os_code=os_code if type(os_code) is int and -(2**31) <= os_code < 2**31 else None,
+        tls=_diagnostic_label(value.get("tls"), _DIAGNOSTIC_TLS),
+    )
 
 
 class NativeEgressTransportError(NativeEgressError):
@@ -148,6 +212,7 @@ class NativeEgressTransportError(NativeEgressError):
         status_code: int | None = None,
         headers: tuple[tuple[str, str], ...] = (),
         body: bytes | None = None,
+        diagnostic: NativeWebSocketDiagnostic | None = None,
     ) -> None:
         super().__init__(message)
         self.failure_phase = failure_phase
@@ -156,6 +221,7 @@ class NativeEgressTransportError(NativeEgressError):
         self.status_code = status_code
         self.headers = headers
         self.body = body
+        self.diagnostic = diagnostic or NativeWebSocketDiagnostic()
 
 
 @dataclass(frozen=True, slots=True)
@@ -463,6 +529,11 @@ class NativeEgressWebSocket:
             self._pump(),
             name=f"native-websocket-pump-{request_id}",
         )
+
+    @property
+    def diagnostic_correlation(self) -> tuple[str, int, int, int | None]:
+        # Values belong to this socket's process, even after helper rotation.
+        return self._request_id, self._generation, self._process.pid, self._process.returncode
 
     async def send_text(self, text: str) -> None:
         await self._send("websocket_send_text", text=text)
@@ -1109,6 +1180,9 @@ class SubprocessNativeEgressClient:
                 failure_phase="helper_read",
             )
         finally:
+            # Snapshot before our cleanup can terminate a still-running helper.
+            failure.helper_returncode_before_cleanup = process.returncode
+            failure.helper_cleanup_requested = process.returncode is None
             self._fail_generation(generation, failure)
             if process.returncode is None:
                 await _stop_process(process)
@@ -1276,13 +1350,17 @@ def _websocket_error_from_event(event: Mapping[str, object]) -> NativeEgressTran
         status_code=status if isinstance(status, int) else None,
         headers=headers,
         body=body,
+        diagnostic=_websocket_diagnostic(event.get("diagnostic")),
     )
 
 
 async def _read_event(stdout: asyncio.StreamReader) -> dict[str, object]:
     line = await stdout.readline()
     if not line:
-        raise NativeEgressProtocolError("native helper closed its stream unexpectedly")
+        raise NativeEgressProtocolError(
+            "native helper closed its stream unexpectedly",
+            diagnostic_origin="helper_stdout_eof",
+        )
     try:
         value = json.loads(line)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:

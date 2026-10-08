@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import ssl
+import uuid
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Mapping, NoReturn, Protocol, Sequence, cast
@@ -37,6 +38,7 @@ from app.core.clients.native_egress import (
     NativeEgressTransportError,
     NativeEgressUnavailable,
     NativeEgressWebSocket,
+    NativeWebSocketDiagnostic,
     NativeWebSocketRequest,
     NativeWebSocketRoutingMetadata,
     discover_native_egress_client,
@@ -54,6 +56,7 @@ from app.core.clients.proxy import (
     _openai_error_detail,
     filter_inbound_headers,
 )
+from app.core.clock import REAL_CLOCK
 from app.core.config.dashboard_overrides import with_dashboard_overrides
 from app.core.config.settings import get_settings
 from app.core.conversation_archive import archive_bytes, archive_text
@@ -201,6 +204,7 @@ class UpstreamWebSocketMessage:
     event_type: str | None = None
     payload: dict[str, JsonValue] | None = None
     routing: NativeWebSocketRoutingMetadata | None = None
+    diagnostic_connection_id: str | None = None
 
 
 class UpstreamWebSocketTransportError(RuntimeError):
@@ -424,30 +428,52 @@ class NativeUpstreamWebSocket:
 
     def __init__(self, websocket: NativeEgressWebSocket) -> None:
         self._websocket = websocket
+        self.diagnostic_connection_id = uuid.uuid4().hex
+        self._opened_at = REAL_CLOCK.monotonic()
+        self._last_sent_at: float | None = None
+        self._last_received_at: float | None = None
+        self._sent_messages = 0
+        self._received_messages = 0
+        self._terminal_logged = False
+        self._local_close_requested = False
 
     async def send_text(self, text: str) -> None:
         try:
             await self._websocket.send_text(text)
         except NativeEgressError as exc:
+            self._log_terminal(exc, operation="send")
             raise _native_websocket_transport_error(exc, operation="send") from None
+        self._sent_messages += 1
+        self._last_sent_at = REAL_CLOCK.monotonic()
 
     async def send_bytes(self, data: bytes) -> None:
         try:
             await self._websocket.send_bytes(data)
         except NativeEgressError as exc:
+            self._log_terminal(exc, operation="send")
             raise _native_websocket_transport_error(exc, operation="send") from None
+        self._sent_messages += 1
+        self._last_sent_at = REAL_CLOCK.monotonic()
 
     async def receive(self) -> UpstreamWebSocketMessage:
         try:
             message = await self._websocket.receive()
         except NativeEgressError as exc:
+            self._log_terminal(exc, operation="receive")
             error = _native_websocket_transport_error(exc, operation="receive")
             return UpstreamWebSocketMessage(
                 kind="error",
+                diagnostic_connection_id=self.diagnostic_connection_id,
                 error=str(error),
                 error_code=_relay_receive_error_code(error.error_code),
             )
+        if message.kind == "close":
+            self._log_terminal(None, operation="receive", close_code=message.close_code)
+        elif message.kind in {"text", "binary"}:
+            self._received_messages += 1
+            self._last_received_at = REAL_CLOCK.monotonic()
         return UpstreamWebSocketMessage(
+            diagnostic_connection_id=self.diagnostic_connection_id,
             kind=message.kind,
             text=message.text,
             data=message.data,
@@ -460,10 +486,101 @@ class NativeUpstreamWebSocket:
         )
 
     async def close(self, code: int = 1000, reason: str = "") -> None:
+        self._local_close_requested = True
         await self._websocket.close(code=code, reason=reason)
 
     def response_header(self, name: str) -> str | None:
         return self._websocket.response_header(name)
+
+    def _log_terminal(
+        self,
+        exc: NativeEgressError | None,
+        *,
+        operation: str,
+        close_code: int | None = None,
+    ) -> None:
+        try:
+            self._emit_terminal_diagnostic(exc, operation=operation, close_code=close_code)
+        except Exception:
+            # A diagnostic sink/filter failure must not replace the transport
+            # outcome. Do not log the logging failure or catch cancellation.
+            pass
+
+    def _emit_terminal_diagnostic(
+        self,
+        exc: NativeEgressError | None,
+        *,
+        operation: str,
+        close_code: int | None = None,
+    ) -> None:
+        if self._terminal_logged:
+            return
+        self._terminal_logged = True
+        now = REAL_CLOCK.monotonic()
+        diagnostic = exc.diagnostic if isinstance(exc, NativeEgressTransportError) else NativeWebSocketDiagnostic()
+        phases = {
+            "setup",
+            "connect",
+            "transport",
+            "protocol",
+            "liveness_timeout",
+            "helper_exit",
+            "helper_read",
+            "helper_write",
+            "shutdown",
+            "websocket_send",
+            "websocket_receive",
+            "cancelled",
+            "consumer_backpressure",
+            "timeout",
+            "request",
+            "websocket",
+        }
+        phase = (
+            exc.failure_phase
+            if isinstance(exc, NativeEgressTransportError) and exc.failure_phase in phases
+            else "unknown"
+        )
+        request_id, generation, pid, returncode = (
+            self._websocket.diagnostic_correlation
+            if isinstance(self._websocket, NativeEgressWebSocket)
+            else (None, None, None, None)
+        )
+        origin = "local_cleanup" if self._local_close_requested else "peer_close" if exc is None else "unknown"
+        if exc is not None and exc.diagnostic_origin in {"helper_stdout_eof", "helper_protocol"}:
+            origin = exc.diagnostic_origin
+        # Application-message observations at this adapter, not TCP reads or
+        # ping/pong timestamps. No raw exception, response, URL or close reason.
+        logger.warning(
+            "native_websocket_terminal connection_id=%s ipc_request_id=%s helper_generation=%s "
+            "helper_pid=%s observed_helper_returncode=%s adapter_operation=%s phase=%s category=%s "
+            "operation=%s protocol=%s io_kind=%s os_code=%s tls=%s close_code=%s "
+            "lifetime_ms=%d last_application_send_ms=%s last_application_receive_ms=%s "
+            "sent_messages=%d received_messages=%d origin=%s helper_returncode_before_cleanup=%s "
+            "helper_cleanup_requested=%s",
+            self.diagnostic_connection_id,
+            request_id,
+            generation,
+            pid,
+            returncode,
+            operation,
+            phase,
+            diagnostic.category,
+            diagnostic.operation,
+            diagnostic.protocol,
+            diagnostic.io_kind,
+            diagnostic.os_code,
+            diagnostic.tls,
+            close_code if type(close_code) is int and 0 <= close_code <= 65535 else None,
+            int((now - self._opened_at) * 1000),
+            int((now - self._last_sent_at) * 1000) if self._last_sent_at is not None else None,
+            int((now - self._last_received_at) * 1000) if self._last_received_at is not None else None,
+            self._sent_messages,
+            self._received_messages,
+            origin,
+            exc.helper_returncode_before_cleanup if exc is not None else None,
+            exc.helper_cleanup_requested if exc is not None else None,
+        )
 
 
 def _native_websocket_transport_error(

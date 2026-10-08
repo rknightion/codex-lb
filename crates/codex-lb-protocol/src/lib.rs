@@ -179,6 +179,7 @@ pub enum NativeEvent {
         status: Option<u16>,
         headers: Vec<(String, String)>,
         body: Option<String>,
+        diagnostic: Option<NativeWebSocketDiagnostic>,
     },
     Cancelled {
         request_id: String,
@@ -190,6 +191,17 @@ pub enum NativeEvent {
         retryable_same_contract: bool,
         is_tls_verification_failure: bool,
     },
+}
+
+/// Content-free diagnostic evidence; never format an underlying error here.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NativeWebSocketDiagnostic {
+    pub category: String,
+    pub operation: String,
+    pub protocol: Option<String>,
+    pub io_kind: Option<String>,
+    pub os_code: Option<i32>,
+    pub tls: Option<String>,
 }
 
 #[cfg(test)]

@@ -56,3 +56,30 @@ GROUP BY sticky_key_source, sticky_kind, sticky_key_hash;
 The affinity history converges with dashboard roles, users, the final compatibility-credential projection and audit actor columns through a no-op merge. Published revisions remain unchanged. Databases already on the authentication branch retain their current credentials and session generations; the earlier credential projection is not replayed on merge-only reupgrade. Databases on the older affinity history run the existing authentication backfills once. Ledgerless schema bootstrap retains those migrations' existing legacy-credential projection behavior.
 
 The subsequent invite migration converges through a second no-op join. Pending, consumed and revoked invite rows retain their hashes, expiry/consumption/revocation times, creator snapshots and flags. The older affinity history creates an empty invite table through the unchanged upstream migration.
+
+
+## Local native websocket diagnostics
+
+Established native websocket failures emit `native_websocket_terminal`. Join its
+`connection_id` to `http_bridge_event event=reader_failure diagnostic_connection_id`.
+The reader trace can be inherited from an earlier turn; the connection join is the
+reliable link. For example, `category=protocol protocol=ResetWithoutClosingHandshake`
+identifies a peer transport ending without the websocket close handshake. It does not
+identify who initiated the underlying TCP interruption or prove a remote service defect.
+
+The Rust helper supplies explicit protocol, I/O, OS and TLS categories through optional
+IPC metadata. Python validates bounded categories before logging. Peer reason text,
+raw exceptions, URLs, headers and content are excluded. Unknown or older IPC metadata
+stays unknown. Helper returncode before cleanup is separate from the later observed
+returncode; a proxy cleanup signal is not evidence that helper death caused the failure.
+
+Timing and counts describe successful application sends/receives at the adapter, not
+ping/pong activity or network packets. Handshake failures keep their existing diagnostics.
+Diagnostic sink exceptions do not replace the existing transport outcome. Cancellation
+is not caught by that exception guard.
+
+The Camden-only troubleshooting alert `codex-lb-stream-incomplete` evaluates active
+reader failures or rejected-anchor 502s over five minutes every minute, threshold >0,
+using the existing apps paging route. It excludes idle reader failures, counts events
+rather than unique requests, and does not monitor log-delivery freshness. Continuous
+firing follows the existing four-hour repeat policy. This branch is not published upstream.

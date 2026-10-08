@@ -140,3 +140,17 @@ These rules encode recurring review blockers observed across codex-lb PRs.
   `simplicity-budget-approved` label; feature documentation goes to `docs/` +
   openspec (never new README sections); dashboard-visible PRs include
   before/after screenshots.
+
+## Camden local websocket diagnostics
+
+This troubleshooting branch is local-only: do not publish it or open an upstream PR
+without explicit authorization. Native websocket diagnostic logs must remain content-free;
+never stringify native exceptions or include headers, bodies, URLs or peer close reasons.
+Join `native_websocket_terminal connection_id` with the bridge reader failure's
+`diagnostic_connection_id`; background reader trace context can belong to an earlier turn.
+The operational contract belongs to the proxy-runtime-observability OpenSpec capability.
+
+Camden deployment uses `/opt/codex-lb/update.sh --sha <exact-local-commit>` after importing
+the commit into `/opt/codex-lb/src`. The updater resets and cleans its checkout: verify it
+is clean and unused first. Its automatic dump rotation deletes beyond ten files; archive
+any dumps that would be rotated before invoking it. Retain the previous image and SHA.

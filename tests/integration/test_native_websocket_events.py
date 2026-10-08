@@ -339,3 +339,122 @@ async def test_native_websocket_routing_preserves_delivery_watermarks(
                 await upstream.close()
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_native_abrupt_peer_close_retains_safe_failure_evidence(caplog) -> None:
+    binary = os.environ.get("CODEX_LB_NATIVE_EGRESS_TEST_BINARY")
+    if not binary:
+        pytest.skip("set CODEX_LB_NATIVE_EGRESS_TEST_BINARY to run the native wire probe")
+
+    async def abort(websocket: Any) -> None:
+        await websocket.recv()
+        await websocket.send("private-response-content")
+        websocket.transport.abort()
+
+    client = SubprocessNativeEgressClient(Path(binary))
+    try:
+        async with serve(abort, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            socket = NativeUpstreamWebSocket(
+                await client.websocket(
+                    NativeWebSocketRequest(
+                        url=f"ws://127.0.0.1:{port}/private-path",
+                        headers={},
+                        connect_timeout_seconds=5,
+                        max_message_bytes=1024 * 1024,
+                    )
+                )
+            )
+            with caplog.at_level("WARNING"):
+                await socket.send_text("private-request-content")
+                assert (await asyncio.wait_for(socket.receive(), 5)).text == "private-response-content"
+                result = await asyncio.wait_for(socket.receive(), 5)
+                assert result.kind == "error"
+                assert result.error == "Upstream websocket receive failed"
+            diagnostic = next(r.message for r in caplog.records if "native_websocket_terminal" in r.message)
+            assert "category=protocol" in diagnostic
+            assert "protocol=ResetWithoutClosingHandshake" in diagnostic
+            assert "operation=receive" in diagnostic
+            assert "sent_messages=1" in diagnostic
+            assert "received_messages=1" in diagnostic
+            assert "helper_generation=1" in diagnostic
+            assert "private-" not in diagnostic
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ["liveness", "helper_exit", "peer_close"])
+async def test_native_terminal_diagnostics_distinguish_observed_failure_modes(caplog, failure_mode: str) -> None:
+    import base64
+    import hashlib
+
+    binary = os.environ.get("CODEX_LB_NATIVE_EGRESS_TEST_BINARY")
+    if not binary:
+        pytest.skip("set CODEX_LB_NATIVE_EGRESS_TEST_BINARY to run the native wire probe")
+
+    async def silent_peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+            key = next(
+                line.split(b":", 1)[1].strip()
+                for line in head.split(b"\r\n")
+                if line.lower().startswith(b"sec-websocket-key:")
+            )
+            accept = base64.b64encode(hashlib.sha1(key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+            writer.write(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                b"Connection: Upgrade\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+            )
+            await writer.drain()
+            if failure_mode == "peer_close":
+                # A valid close frame containing a private reason must remain private.
+                payload = (1011).to_bytes(2, "big") + b"private-reason"
+                writer.write(bytes([0x88, len(payload)]) + payload)
+                await writer.drain()
+            while await asyncio.wait_for(reader.read(4096), 5):
+                pass  # Intentionally never answer pings.
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    client = SubprocessNativeEgressClient(Path(binary))
+    try:
+        async with await asyncio.start_server(silent_peer, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            socket = NativeUpstreamWebSocket(
+                await client.websocket(
+                    NativeWebSocketRequest(
+                        url=f"ws://127.0.0.1:{port}/private-path",
+                        headers={},
+                        connect_timeout_seconds=5,
+                        max_message_bytes=1024 * 1024,
+                        ping_interval_seconds=0.02 if failure_mode == "liveness" else None,
+                        ping_timeout_seconds=0.05 if failure_mode == "liveness" else None,
+                    )
+                )
+            )
+            with caplog.at_level("WARNING"):
+                if failure_mode == "helper_exit":
+                    assert client._process is not None
+                    client._process.kill()
+                    await client._process.wait()
+                result = await asyncio.wait_for(socket.receive(), 5)
+            diagnostic = next(r.message for r in caplog.records if "native_websocket_terminal" in r.message)
+            assert "private-" not in diagnostic
+            if failure_mode == "liveness":
+                assert result.kind == "error"
+                assert "category=liveness_timeout" in diagnostic
+                assert "operation=pong_wait" in diagnostic
+            elif failure_mode == "helper_exit":
+                assert result.kind == "error"
+                assert "origin=helper_stdout_eof" in diagnostic
+                assert "observed_helper_returncode=-9" in diagnostic
+            else:
+                assert result.kind == "close"
+                assert result.close_code == 1011
+                assert "origin=peer_close" in diagnostic
+                assert "close_code=1011" in diagnostic
+    finally:
+        await client.aclose()

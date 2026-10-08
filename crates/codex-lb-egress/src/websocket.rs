@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
-use codex_lb_protocol::{NativeEvent, NativeWebSocketRequest};
+use codex_lb_protocol::{NativeEvent, NativeWebSocketDiagnostic, NativeWebSocketRequest};
 use codex_lb_responses::stream::interpret_websocket;
 use futures_util::{SinkExt, StreamExt};
 use rustls::{ClientConfig, RootCertStore};
@@ -14,7 +14,7 @@ use tokio_tungstenite::Connector;
 use tokio_tungstenite::client_async_tls_with_config;
 use tokio_tungstenite::proxy::connect_via_proxy;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::error::TlsError;
+use tokio_tungstenite::tungstenite::error::{ProtocolError, TlsError};
 use tokio_tungstenite::tungstenite::handshake::client::Response as WebSocketResponse;
 use tokio_tungstenite::tungstenite::http::HeaderName as WebSocketHeaderName;
 use tokio_tungstenite::tungstenite::http::HeaderValue as WebSocketHeaderValue;
@@ -52,7 +52,7 @@ pub(crate) enum WebSocketCommand {
 #[derive(Debug)]
 pub(crate) enum NativeWebSocketFailure {
     Connect(WebSocketError),
-    WebSocket(WebSocketError),
+    WebSocket(WebSocketError, &'static str),
     Timeout,
     LivenessTimeout,
     Output(std::io::Error),
@@ -62,7 +62,7 @@ impl std::fmt::Display for NativeWebSocketFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Connect(error) => write!(formatter, "{error}"),
-            Self::WebSocket(error) => write!(formatter, "{error}"),
+            Self::WebSocket(error, _) => write!(formatter, "{error}"),
             Self::Timeout => formatter.write_str("websocket connect timed out"),
             Self::LivenessTimeout => formatter.write_str("websocket pong timed out"),
             Self::Output(error) => write!(formatter, "{error}"),
@@ -74,7 +74,7 @@ impl std::error::Error for NativeWebSocketFailure {}
 
 impl From<WebSocketError> for NativeWebSocketFailure {
     fn from(error: WebSocketError) -> Self {
-        Self::WebSocket(error)
+        Self::WebSocket(error, "receive")
     }
 }
 
@@ -123,7 +123,8 @@ pub(crate) async fn execute_websocket(
                 if awaiting_pong.is_none() {
                     ping_sequence = ping_sequence.wrapping_add(1);
                     let payload = Bytes::copy_from_slice(&ping_sequence.to_be_bytes());
-                    websocket.send(Message::Ping(payload.clone())).await?;
+                    websocket.send(Message::Ping(payload.clone())).await
+                        .map_err(|error| NativeWebSocketFailure::WebSocket(error, "ping"))?;
                     if let Some(timeout) = ping_timeout {
                         awaiting_pong = Some(payload);
                         pong_deadline.as_mut().reset(tokio::time::Instant::now() + timeout);
@@ -154,7 +155,7 @@ pub(crate) async fn execute_websocket(
                                     output,
                                     &request_id,
                                     Some(command_id),
-                                    &NativeWebSocketFailure::WebSocket(error),
+                                    &NativeWebSocketFailure::WebSocket(error, "send"),
                                 ).await?;
                                 return Ok(());
                             }
@@ -189,7 +190,7 @@ pub(crate) async fn execute_websocket(
                                     output,
                                     &request_id,
                                     Some(command_id),
-                                    &NativeWebSocketFailure::WebSocket(error),
+                                    &NativeWebSocketFailure::WebSocket(error, "close"),
                                 ).await?;
                                 return Ok(());
                             }
@@ -240,7 +241,7 @@ pub(crate) async fn execute_websocket(
                     }
                     Some(Ok(Message::Ping(payload))) => {
                         if let Err(error) = websocket.send(Message::Pong(payload)).await {
-                            return Err(error.into());
+                            return Err(NativeWebSocketFailure::WebSocket(error, "pong"));
                         }
                     }
                     Some(Ok(Message::Pong(payload))) => {
@@ -437,6 +438,7 @@ pub(crate) async fn emit_websocket_setup_error(
             status: None,
             headers: Vec::new(),
             body: None,
+            diagnostic: None,
         },
     )
     .await
@@ -503,7 +505,7 @@ pub(crate) async fn emit_websocket_error(
                 None,
             )
         }
-        NativeWebSocketFailure::WebSocket(WebSocketError::Io(_)) => (
+        NativeWebSocketFailure::WebSocket(WebSocketError::Io(_), _) => (
             "native websocket transport failed",
             "transport",
             false,
@@ -512,7 +514,7 @@ pub(crate) async fn emit_websocket_error(
             Vec::new(),
             None,
         ),
-        NativeWebSocketFailure::WebSocket(_) => (
+        NativeWebSocketFailure::WebSocket(_, _) => (
             "native websocket protocol failed",
             "protocol",
             false,
@@ -543,6 +545,7 @@ pub(crate) async fn emit_websocket_error(
             status,
             headers,
             body,
+            diagnostic: Some(websocket_diagnostic(failure)),
         },
     )
     .await
@@ -551,12 +554,211 @@ pub(crate) async fn emit_websocket_error(
 fn websocket_tls_verification_failure(failure: &NativeWebSocketFailure) -> bool {
     match failure {
         NativeWebSocketFailure::Connect(WebSocketError::Tls(TlsError::Rustls(error)))
-        | NativeWebSocketFailure::WebSocket(WebSocketError::Tls(TlsError::Rustls(error))) => {
+        | NativeWebSocketFailure::WebSocket(WebSocketError::Tls(TlsError::Rustls(error)), _) => {
             matches!(error.as_ref(), rustls::Error::InvalidCertificate(_))
         }
-        NativeWebSocketFailure::Connect(error) | NativeWebSocketFailure::WebSocket(error) => {
+        NativeWebSocketFailure::Connect(error) | NativeWebSocketFailure::WebSocket(error, _) => {
             error_chain_has_invalid_certificate(error)
         }
         _ => false,
+    }
+}
+
+fn websocket_diagnostic(failure: &NativeWebSocketFailure) -> NativeWebSocketDiagnostic {
+    let mut diagnostic = NativeWebSocketDiagnostic {
+        category: "unknown".into(),
+        operation: "unknown".into(),
+        protocol: None,
+        io_kind: None,
+        os_code: None,
+        tls: None,
+    };
+    let error = match failure {
+        NativeWebSocketFailure::Connect(error) => {
+            diagnostic.operation = "connect".into();
+            error
+        }
+        NativeWebSocketFailure::WebSocket(error, operation) => {
+            diagnostic.operation = (*operation).into();
+            error
+        }
+        NativeWebSocketFailure::Timeout => {
+            diagnostic.category = "timeout".into();
+            diagnostic.operation = "connect".into();
+            return diagnostic;
+        }
+        NativeWebSocketFailure::LivenessTimeout => {
+            diagnostic.category = "liveness_timeout".into();
+            diagnostic.operation = "pong_wait".into();
+            return diagnostic;
+        }
+        NativeWebSocketFailure::Output(error) => {
+            diagnostic.operation = "helper_write".into();
+            io_diagnostic(error, &mut diagnostic);
+            return diagnostic;
+        }
+    };
+    diagnostic.category = match error {
+        WebSocketError::ConnectionClosed => "connection_closed",
+        WebSocketError::AlreadyClosed => "already_closed",
+        WebSocketError::Io(error) => {
+            io_diagnostic(error, &mut diagnostic);
+            "io"
+        }
+        WebSocketError::Tls(error) => {
+            diagnostic.tls = Some(
+                match error {
+                    TlsError::InvalidDnsName => "invalid_dns_name",
+                    TlsError::Rustls(error) => match error.as_ref() {
+                        rustls::Error::InvalidCertificate(_) => "invalid_certificate",
+                        rustls::Error::AlertReceived(_) => "alert_received",
+                        _ => "rustls_other",
+                    },
+                    _ => "other",
+                }
+                .into(),
+            );
+            "tls"
+        }
+        WebSocketError::Protocol(error) => {
+            diagnostic.protocol = Some(protocol_category(error).into());
+            "protocol"
+        }
+        WebSocketError::Capacity(_) => "capacity",
+        WebSocketError::WriteBufferFull(_) => "write_buffer_full",
+        WebSocketError::Utf8(_) => "utf8",
+        WebSocketError::AttackAttempt => "attack_attempt",
+        WebSocketError::Url(_) => "url",
+        WebSocketError::Http(_) => "http",
+        WebSocketError::HttpFormat(_) => "http_format",
+    }
+    .into();
+    if websocket_tls_verification_failure(failure) {
+        diagnostic.tls = Some("invalid_certificate".into());
+    }
+    diagnostic
+}
+
+fn io_diagnostic(error: &std::io::Error, diagnostic: &mut NativeWebSocketDiagnostic) {
+    use std::io::ErrorKind;
+    diagnostic.category = "io".into();
+    diagnostic.os_code = error.raw_os_error();
+    diagnostic.io_kind = Some(
+        match error.kind() {
+            ErrorKind::ConnectionReset => "connection_reset",
+            ErrorKind::ConnectionAborted => "connection_aborted",
+            ErrorKind::ConnectionRefused => "connection_refused",
+            ErrorKind::BrokenPipe => "broken_pipe",
+            ErrorKind::NotConnected => "not_connected",
+            ErrorKind::TimedOut => "timed_out",
+            ErrorKind::UnexpectedEof => "unexpected_eof",
+            ErrorKind::WouldBlock => "would_block",
+            ErrorKind::Interrupted => "interrupted",
+            ErrorKind::InvalidData => "invalid_data",
+            ErrorKind::PermissionDenied => "permission_denied",
+            ErrorKind::Other => "other",
+            _ => "unclassified",
+        }
+        .into(),
+    );
+    // rustls read failures may be nested in io::Error; never stringify them.
+    if let Some(tls) = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+    {
+        diagnostic.tls = Some(
+            match tls {
+                rustls::Error::InvalidCertificate(_) => "invalid_certificate",
+                rustls::Error::AlertReceived(_) => "alert_received",
+                _ => "rustls_other",
+            }
+            .into(),
+        );
+    }
+}
+
+fn protocol_category(error: &ProtocolError) -> &'static str {
+    match error {
+        ProtocolError::WrongHttpMethod => "WrongHttpMethod",
+        ProtocolError::WrongHttpVersion => "WrongHttpVersion",
+        ProtocolError::MissingConnectionUpgradeHeader => "MissingConnectionUpgradeHeader",
+        ProtocolError::MissingUpgradeWebSocketHeader => "MissingUpgradeWebSocketHeader",
+        ProtocolError::MissingSecWebSocketVersionHeader => "MissingSecWebSocketVersionHeader",
+        ProtocolError::MissingSecWebSocketKey => "MissingSecWebSocketKey",
+        ProtocolError::SecWebSocketAcceptKeyMismatch => "SecWebSocketAcceptKeyMismatch",
+        ProtocolError::SecWebSocketSubProtocolError(_) => "SecWebSocketSubProtocolError",
+        ProtocolError::InvalidExtensionsHeader(_) => "InvalidExtensionsHeader",
+        ProtocolError::JunkAfterRequest => "JunkAfterRequest",
+        ProtocolError::CustomResponseSuccessful => "CustomResponseSuccessful",
+        ProtocolError::InvalidHeader(_) => "InvalidHeader",
+        ProtocolError::HandshakeIncomplete => "HandshakeIncomplete",
+        ProtocolError::HttparseError(_) => "HttparseError",
+        ProtocolError::SendAfterClosing => "SendAfterClosing",
+        ProtocolError::ReceivedAfterClosing => "ReceivedAfterClosing",
+        ProtocolError::NonZeroReservedBits => "NonZeroReservedBits",
+        ProtocolError::UnmaskedFrameFromClient => "UnmaskedFrameFromClient",
+        ProtocolError::MaskedFrameFromServer => "MaskedFrameFromServer",
+        ProtocolError::FragmentedControlFrame => "FragmentedControlFrame",
+        ProtocolError::CompressedControlFrame => "CompressedControlFrame",
+        ProtocolError::ControlFrameTooBig => "ControlFrameTooBig",
+        ProtocolError::UnknownControlFrameType(_) => "UnknownControlFrameType",
+        ProtocolError::UnknownDataFrameType(_) => "UnknownDataFrameType",
+        ProtocolError::UnexpectedContinueFrame => "UnexpectedContinueFrame",
+        ProtocolError::CompressedContinueFrame => "CompressedContinueFrame",
+        ProtocolError::ExpectedFragment(_) => "ExpectedFragment",
+        ProtocolError::ResetWithoutClosingHandshake => "ResetWithoutClosingHandshake",
+        ProtocolError::InvalidOpcode(_) => "InvalidOpcode",
+        ProtocolError::InvalidCloseSequence => "InvalidCloseSequence",
+        ProtocolError::CompressionFailure(_) => "CompressionFailure",
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_never_serializes_error_content() {
+        let failures = [
+            NativeWebSocketFailure::WebSocket(
+                WebSocketError::Utf8("private-payload".into()),
+                "receive",
+            ),
+            NativeWebSocketFailure::WebSocket(
+                WebSocketError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "private-peer",
+                )),
+                "receive",
+            ),
+            NativeWebSocketFailure::Connect(WebSocketError::Protocol(
+                ProtocolError::InvalidHeader(Box::new(WebSocketHeaderName::from_static(
+                    "private-header",
+                ))),
+            )),
+        ];
+        for failure in failures {
+            let value = serde_json::to_string(&websocket_diagnostic(&failure)).unwrap();
+            assert!(!value.contains("private-"));
+        }
+        let reset = websocket_diagnostic(&NativeWebSocketFailure::WebSocket(
+            WebSocketError::Protocol(ProtocolError::ResetWithoutClosingHandshake),
+            "receive",
+        ));
+        assert_eq!(reset.category, "protocol");
+        assert_eq!(
+            reset.protocol.as_deref(),
+            Some("ResetWithoutClosingHandshake")
+        );
+        let io = std::io::Error::from_raw_os_error(104);
+        let expected_kind = io.kind();
+        let diagnostic = websocket_diagnostic(&NativeWebSocketFailure::WebSocket(
+            WebSocketError::Io(io),
+            "receive",
+        ));
+        assert_eq!(diagnostic.os_code, Some(104));
+        if expected_kind == std::io::ErrorKind::ConnectionReset {
+            assert_eq!(diagnostic.io_kind.as_deref(), Some("connection_reset"));
+        }
     }
 }
