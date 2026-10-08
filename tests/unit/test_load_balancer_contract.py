@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator, Collection
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -981,3 +982,62 @@ async def test_non_sticky_cache_generation_change_reselects_and_releases_once(
 
     await balancer.release_account_lease(selection.lease)
     assert await balancer.account_pressure_snapshot(account.id) == (0, 0, 0.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_path", ["unbound", "required_sticky", "hard_sticky"])
+async def test_hard_owner_transient_backoff_admits_without_erasing_health(
+    selection_cache: AccountSelectionCache,
+    owner_path: str,
+) -> None:
+    owner = _account("backoff-owner")
+    sibling = _account("backoff-sibling")
+    balancer, _, _, sticky_repo = _balancer([owner, sibling], selection_cache)
+    last_error = time.time() - 1.0
+    balancer._runtime[owner.id] = load_balancer_module.RuntimeState(error_count=5, last_error_at=last_error)
+    if owner_path != "unbound":
+        sticky_repo.account_id = owner.id
+    selection = await balancer.select_account(
+        sticky_key=None if owner_path == "unbound" else "backoff-owned-session",
+        sticky_kind=(
+            StickySessionKind.CODEX_SESSION if owner_path == "hard_sticky" else StickySessionKind.PROMPT_CACHE
+        ),
+        required_account_id=None if owner_path == "hard_sticky" else owner.id,
+        required_continuity_owner=owner_path != "hard_sticky",
+        lease_kind="stream",
+        concurrency_caps=_CONCURRENCY_CAPS,
+    )
+    assert selection.account is not None, selection.error_code
+    assert selection.account.id == owner.id
+    assert selection.lease is not None
+    assert balancer._runtime[owner.id].error_count == 5
+    assert balancer._runtime[owner.id].last_error_at == last_error
+    assert (await balancer.account_pressure_snapshot(owner.id))[1] == 1
+    await balancer.release_account_lease(selection.lease)
+    assert (await balancer.account_pressure_snapshot(owner.id))[1] == 0
+    if owner_path != "unbound":
+        assert sticky_repo.account_id == owner.id
+
+
+@pytest.mark.asyncio
+async def test_required_owner_backoff_does_not_bypass_stream_cap(selection_cache: AccountSelectionCache) -> None:
+    owner = _account("capped-backoff-owner")
+    balancer, _, _, _ = _balancer([owner, _account("capped-backoff-sibling")], selection_cache)
+    lease = await balancer.acquire_account_lease(owner.id, kind="stream", concurrency_caps=_CONCURRENCY_CAPS)
+    assert lease is not None
+    runtime = balancer._runtime[owner.id]
+    runtime.error_count = 5
+    runtime.last_error_at = time.time() - 1.0
+    try:
+        selection = await balancer.select_account(
+            required_account_id=owner.id,
+            required_continuity_owner=True,
+            lease_kind="stream",
+            concurrency_caps=_CONCURRENCY_CAPS,
+        )
+        assert selection.account is None
+        assert selection.lease is None
+        assert (await balancer.account_pressure_snapshot(owner.id))[1] == 1
+    finally:
+        await balancer.release_account_lease(lease)
+    assert (await balancer.account_pressure_snapshot(owner.id))[1] == 0

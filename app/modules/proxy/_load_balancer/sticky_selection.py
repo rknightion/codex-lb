@@ -283,6 +283,7 @@ class StickySelectionOwner(Protocol):
         allow_usage_exhaustion_error: bool = True,
         usage_exhaustion_states: Iterable[AccountState] | None = None,
         sticky_refresh_skip_deadline: datetime | None = None,
+        hard_owner_pool: bool = False,
         redact_sensitive_details: bool = False,
     ) -> _StickySelectionOutcome: ...
 
@@ -873,6 +874,8 @@ async def run_sticky_selection_path(
                 routing_costs_by_account_id=effective_routing_costs,
                 allow_usage_exhaustion_error=allow_usage_exhaustion_error,
                 usage_exhaustion_states=states,
+                # The resolved hard owner has no fallback sibling.
+                hard_owner_pool=True,
             )
             if result.account is None:
                 selection_error_code = "hard_affinity_saturated"
@@ -918,6 +921,8 @@ async def run_sticky_selection_path(
                         allow_usage_exhaustion_error=allow_usage_exhaustion_error,
                         usage_exhaustion_states=states,
                         sticky_refresh_skip_deadline=sticky_refresh_skip_deadline,
+                        # State preparation already narrowed to the required owner.
+                        hard_owner_pool=required_account_id is not None,
                         redact_sensitive_details=redact_sensitive_details,
                     )
                     result = sticky_outcome.selection
@@ -1429,6 +1434,7 @@ async def _select_with_stickiness(
     usage_exhaustion_states: Iterable[AccountState] | None = None,
     sticky_refresh_skip_deadline: datetime | None = None,
     overload_backoff_runtime: Mapping[str, RuntimeState] | None = None,
+    hard_owner_pool: bool = False,
     clock: Clock,
     redact_sensitive_details: bool = False,
 ) -> _StickySelectionOutcome:
@@ -1436,6 +1442,7 @@ async def _select_with_stickiness(
         return _StickySelectionOutcome(
             selection=_select_account_preferring_budget_safe(
                 states,
+                hard_owner_pool=hard_owner_pool,
                 prefer_earlier_reset=prefer_earlier_reset_accounts,
                 prefer_earlier_reset_window=prefer_earlier_reset_window,
                 routing_strategy=routing_strategy,
@@ -1526,6 +1533,7 @@ async def _select_with_stickiness(
     def _choose_from(candidates: list[AccountState], *, selection_seed: str | None = None) -> SelectionResult:
         return _select_account_preferring_budget_safe(
             candidates,
+            hard_owner_pool=hard_owner_pool,
             selection_seed=selection_seed,
             prefer_earlier_reset=prefer_earlier_reset_accounts,
             prefer_earlier_reset_window=prefer_earlier_reset_window,
@@ -1572,7 +1580,9 @@ async def _select_with_stickiness(
                 prefer_earlier_reset=prefer_earlier_reset_accounts,
                 prefer_earlier_reset_window=prefer_earlier_reset_window,
                 routing_strategy=routing_strategy,
-                allow_backoff_fallback=False,
+                # Soft seeds can yield to siblings; required owners cannot.
+                allow_backoff_fallback=hard_owner_pool,
+                hard_owner_pool=hard_owner_pool,
                 relative_availability_power=relative_availability_power,
                 relative_availability_top_k=relative_availability_top_k,
                 traffic_class=traffic_class,
@@ -1733,7 +1743,9 @@ async def _select_with_stickiness(
                     prefer_earlier_reset=prefer_earlier_reset_accounts,
                     prefer_earlier_reset_window=prefer_earlier_reset_window,
                     routing_strategy=routing_strategy,
-                    allow_backoff_fallback=False,
+                    # Preserve a required owner through soft runtime backoff.
+                    allow_backoff_fallback=hard_owner_pool,
+                    hard_owner_pool=hard_owner_pool,
                     relative_availability_power=relative_availability_power,
                     relative_availability_top_k=relative_availability_top_k,
                     traffic_class=traffic_class,
@@ -1759,6 +1771,7 @@ async def _select_with_stickiness(
                     apply_sticky_secondary_budget_threshold = True
                     pool_best = _select_account_preferring_budget_safe(
                         states,
+                        hard_owner_pool=hard_owner_pool,
                         prefer_earlier_reset=prefer_earlier_reset_accounts,
                         prefer_earlier_reset_window=prefer_earlier_reset_window,
                         routing_strategy=routing_strategy,
@@ -1788,7 +1801,8 @@ async def _select_with_stickiness(
                             prefer_earlier_reset=prefer_earlier_reset_accounts,
                             prefer_earlier_reset_window=prefer_earlier_reset_window,
                             routing_strategy=routing_strategy,
-                            allow_backoff_fallback=False,
+                            allow_backoff_fallback=hard_owner_pool,
+                            hard_owner_pool=hard_owner_pool,
                             relative_availability_power=relative_availability_power,
                             relative_availability_top_k=relative_availability_top_k,
                             traffic_class=traffic_class,
@@ -2248,6 +2262,7 @@ def _select_account_preferring_budget_safe(
     secondary_budget_threshold_pct: float = 100.0,
     apply_secondary_budget_threshold: bool = False,
     allow_backoff_fallback: bool = True,
+    hard_owner_pool: bool = False,
     deterministic_probe: bool = False,
     traffic_class: TrafficClass = TRAFFIC_CLASS_FOREGROUND,
     ignore_standard_quota: bool = False,
@@ -2274,6 +2289,7 @@ def _select_account_preferring_budget_safe(
             prefer_earlier_reset_window=prefer_earlier_reset_window,
             routing_strategy=routing_strategy,
             allow_backoff_fallback=allow_backoff_fallback,
+            hard_owner_pool=hard_owner_pool,
             deterministic_probe=deterministic_probe,
             recovery_probe_only=True,
             relative_availability_power=relative_availability_power,
@@ -2308,6 +2324,7 @@ def _select_account_preferring_budget_safe(
             prefer_earlier_reset_window=prefer_earlier_reset_window,
             routing_strategy=routing_strategy,
             allow_backoff_fallback=allow_backoff_fallback,
+            hard_owner_pool=hard_owner_pool,
             deterministic_probe=deterministic_probe,
             relative_availability_power=relative_availability_power,
             relative_availability_top_k=relative_availability_top_k,
@@ -2354,6 +2371,7 @@ def _select_account_preferring_budget_safe(
             prefer_earlier_reset_window=prefer_earlier_reset_window,
             routing_strategy=routing_strategy,
             allow_backoff_fallback=allow_backoff_fallback,
+            hard_owner_pool=hard_owner_pool,
             deterministic_probe=deterministic_probe,
             relative_availability_power=relative_availability_power,
             relative_availability_top_k=relative_availability_top_k,
@@ -2375,6 +2393,7 @@ def _select_account_preferring_budget_safe(
             prefer_earlier_reset_window=prefer_earlier_reset_window,
             routing_strategy=routing_strategy,
             allow_backoff_fallback=allow_backoff_fallback,
+            hard_owner_pool=hard_owner_pool,
             deterministic_probe=deterministic_probe,
             usage_weighted_order="primary_first",
             traffic_class=traffic_class,
@@ -2390,6 +2409,7 @@ def _select_account_preferring_budget_safe(
         prefer_earlier_reset_window=prefer_earlier_reset_window,
         routing_strategy=routing_strategy,
         allow_backoff_fallback=allow_backoff_fallback,
+        hard_owner_pool=hard_owner_pool,
         deterministic_probe=deterministic_probe,
         relative_availability_power=relative_availability_power,
         relative_availability_top_k=relative_availability_top_k,

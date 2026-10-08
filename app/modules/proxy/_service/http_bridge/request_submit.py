@@ -154,6 +154,7 @@ from app.modules.proxy._service.http_bridge.service_stubs import (
 )
 from app.modules.proxy._service.http_bridge.upstream_events import (
     _abandon_durable_http_bridge_continuity,
+    _retire_abandoned_http_bridge_anchor,
 )
 from app.modules.proxy._service.observability import (
     _hash_identifier as _hash_identifier,
@@ -1175,6 +1176,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 cache_key_family=session.key.affinity_kind,
                 model_class=_extract_model_class(session.request_model) if session.request_model else None,
             )
+            await _retire_abandoned_http_bridge_anchor(self, session, response_id=request_state.previous_response_id)
             raise ProxyResponseError(
                 404,
                 openai_error(

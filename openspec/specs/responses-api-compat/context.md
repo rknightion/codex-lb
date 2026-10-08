@@ -332,3 +332,7 @@ Finalization may issue several upstream polls within one downstream call. A refu
 ## Operator-accepted fresh starts on unavailable owners
 
 The local Camden troubleshooting policy permits a new upstream conversation when a long-unavailable account owns an injected anchor and the current request body is portable. Complete verified replay remains preferred. The fallback intentionally loses earlier upstream context; loop goals on disk are the operator's recovery source, not something codex-lb reads. Explicit client anchors and file ownership retain their safety constraints. Captured circuit and quarantine generations permit clearing only the obsolete failure episode, and the canonical replacement binding supports later turns without changing shared sibling aliases.
+
+## Local continuity recovery follow-up
+
+Closing the downstream response must cascade through normalization, startup, error and direct/fallback generators to the owned provider iterator. Otherwise a failed native response can leave its account stream lease occupied until garbage collection. The cleanup repair preserves existing terminal codes and native error delivery semantics; it does not make ambiguous executions safe to replay.

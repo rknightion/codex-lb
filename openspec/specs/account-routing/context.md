@@ -178,3 +178,7 @@ short windows, or evaluated for a quota the plan does not have.
 Settlement is discarded if newer replica-local runtime activity arrives while
 that snapshot is loading, preventing an older probe success from clearing a
 later failure.
+
+## Local continuity recovery follow-up
+
+A continuity owner in transient error-count backoff has no alternative owner. Selection may retain that exact singleton while preserving counters, persisted quota/auth restrictions and admission caps. This does not make an exhausted owner eligible; it avoids manufacturing an unavailable pool from soft runtime health alone.

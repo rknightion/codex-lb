@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import sys
 from typing import Any, AsyncIterator, Mapping, cast
 
 import aiohttp
@@ -264,6 +263,8 @@ from app.modules.proxy._service.observability import (
 )
 from app.modules.proxy._service.streaming.helpers import (
     _classify_terminal_stream_error_frame,
+    _close_owned_upstream_iterator,
+    _facade,
     _mark_downstream_stream_cancelled,
     _mark_upstream_stream_incomplete,
     _observe_terminal_stream_error_frame,
@@ -422,11 +423,6 @@ from app.modules.proxy.tool_call_dedupe import (
 )
 from app.modules.proxy.work_admission import AdmissionLease
 
-
-def _facade() -> Any:
-    return sys.modules["app.modules.proxy.service"]
-
-
 _REQUEST_TRANSPORT_HTTP = "http"
 
 
@@ -558,6 +554,7 @@ class _StreamingMixin(_StreamingRetryMixin):
                     stop_event=api_key_reservation_heartbeat_stop,
                 )
             )
+        iterator: AsyncIterator[str] | None = None
         try:
             route = await proxy._resolve_upstream_route_for_account(account, operation="responses")
             account_response_create_lease = await proxy._acquire_account_response_create_lease_or_overload(
@@ -1021,6 +1018,7 @@ class _StreamingMixin(_StreamingRetryMixin):
                 return
             raise
         finally:
+            await _close_owned_upstream_iterator(iterator)
             api_key_reservation_heartbeat_stop.set()
             if api_key_reservation_heartbeat_task is not None:
                 proxy._cancel_api_key_reservation_heartbeat_task(api_key_reservation_heartbeat_task)

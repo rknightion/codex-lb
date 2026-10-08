@@ -217,6 +217,8 @@ async def run_unbound_selection_path(
                 def _select_from(candidates: list[AccountState]) -> SelectionResult:
                     return _select_account_preferring_budget_safe(
                         candidates,
+                        # State preparation already narrowed to the required owner.
+                        hard_owner_pool=required_account_id is not None,
                         prefer_earlier_reset=prefer_earlier_reset_accounts,
                         prefer_earlier_reset_window=prefer_earlier_reset_window,
                         routing_strategy=routing_strategy,
@@ -235,9 +237,8 @@ async def run_unbound_selection_path(
                 # rejecting as overloaded. The cap-filtered pool stays intact
                 # for cap-error detection below, and when the configured
                 # strategy rejects every overload-free candidate the full pool
-                # is selected from exactly as before. Sticky and continuity
-                # selection never reach this path, so warm sessions on those
-                # accounts keep flowing.
+                # is selected from exactly as before. A required owner already
+                # narrowed the pool, so soft overload filtering cannot move it.
                 overload_free_states = filter_overload_backoff_candidates(
                     selection_states,
                     owner._runtime,

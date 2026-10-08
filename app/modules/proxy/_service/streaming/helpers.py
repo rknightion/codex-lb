@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import sys
 from collections.abc import Callable
 from copy import deepcopy
 from typing import Any, AsyncIterator, Literal, Mapping, cast
+
+import anyio
 
 from app.core.balancer import PERMANENT_FAILURE_CODES
 from app.core.balancer.types import ClassifiedFailure, UpstreamError
@@ -431,6 +434,18 @@ from app.modules.usage.updater import UsageUpdater
 
 def _facade() -> Any:
     return sys.modules["app.modules.proxy.service"]
+
+
+async def _close_owned_upstream_iterator(iterator: AsyncIterator[str] | None) -> None:
+    """Release the provider in its task context without hiding the original failure."""
+    close = getattr(iterator, "aclose", None)
+    if not callable(close):
+        return
+    try:
+        with anyio.CancelScope(shield=True):
+            await close()
+    except (Exception, asyncio.CancelledError):
+        _facade().logger.warning("Upstream response stream cleanup failed")
 
 
 def _canonical_background_ack(

@@ -22,6 +22,72 @@ async def _iter_blocks(*blocks: str) -> AsyncIterator[str]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("startup_task", [False, True], ids=["buffered-first", "pending-probe"])
+async def test_responses_close_cascades_through_cancelled_wrappers(startup_task: bool) -> None:
+    closed = asyncio.Event()
+
+    async def source() -> AsyncIterator[str]:
+        try:
+            yield 'data: {"type":"response.created","response":{"id":"resp_close"}}\n\n'
+            yield 'data: {"type":"response.output_text.delta","delta":"fixture"}\n\n'
+        finally:
+            await asyncio.sleep(0)
+            closed.set()
+
+    raw = source()
+    if startup_task:
+        probe = asyncio.create_task(anext(raw))
+        stream = proxy_api_module._prepend_first_task(probe, raw)
+    else:
+        stream = proxy_api_module._prepend_first(await anext(raw), raw)
+    stream = proxy_api_module._normalize_public_responses_stream(
+        proxy_api_module._stream_response_error_events(stream, owns_reservation=False, reservation=None),
+        enforce_openai_sdk_contract=False,
+        preserve_native_failure_lifecycle=True,
+    )
+    try:
+        await anext(stream)
+        with anyio.CancelScope() as scope:
+            scope.cancel()
+            await stream.aclose()
+        assert closed.is_set()
+    finally:
+        await raw.aclose()
+
+
+@pytest.mark.asyncio
+async def test_responses_normalizer_abort_preserves_error_when_source_close_fails() -> None:
+    from app.core.clients.proxy import ProxyResponseError
+
+    close_attempted = False
+
+    async def source() -> AsyncIterator[str]:
+        nonlocal close_attempted
+        try:
+            yield 'data: {"type":"response.failed","_codex_lb_synthetic_transport_failure":true}\n\n'
+        finally:
+            close_attempted = True
+            raise ValueError("fixture cleanup failure")
+
+    raw = source()
+    stream = proxy_api_module._normalize_public_responses_stream(
+        proxy_api_module._stream_response_error_events(raw, owns_reservation=False, reservation=None),
+        enforce_openai_sdk_contract=False,
+        preserve_native_failure_lifecycle=True,
+    )
+    try:
+        with pytest.raises(ProxyResponseError) as failure:
+            await anext(stream)
+        assert failure.value.payload["error"]["code"] == "stream_incomplete"
+        assert close_attempted
+    finally:
+        try:
+            await raw.aclose()
+        except ValueError:
+            pass
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure_type", [RuntimeError, asyncio.CancelledError], ids=["error", "cancelled"])
 @pytest.mark.parametrize(("owns_reservation", "expected_releases"), [(True, 1), (False, 0)])
 async def test_rate_limit_header_failure_releases_only_owned_reservation(

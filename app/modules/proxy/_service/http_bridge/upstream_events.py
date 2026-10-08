@@ -1453,6 +1453,64 @@ async def _abandon_durable_http_bridge_continuity(
     return True
 
 
+async def _retire_abandoned_http_bridge_anchor(
+    service: Any,
+    session: "_HTTPBridgeSession",
+    *,
+    response_id: str | None,
+) -> None:
+    """Retire a locally refused anchor without inventing an upstream denial.
+
+    The existing abandonment circuit remains the admission fence. Unlike an
+    upstream denial, this refusal supplies no new evidence about prepared
+    siblings, so it must not publish a denied-anchor generation.
+    """
+    if response_id is None:
+        return
+    async with session.lifecycle_lock:
+        if session.last_completed_response_id != response_id:
+            return
+        session_id = session.durable_session_id
+        owner_epoch = session.durable_owner_epoch
+        registration_generation = session.previous_response_alias_registration_generations.get(response_id)
+    try:
+        if session_id is not None and owner_epoch is not None:
+            cleared = await service._durable_bridge.clear_live_session_response_anchor_if_matches(
+                session_id=session_id,
+                api_key_id=session.key.api_key_id,
+                instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
+                owner_epoch=owner_epoch,
+                response_id=response_id,
+            )
+            if cleared is None:
+                return
+        async with session.lifecycle_lock:
+            if (
+                session.durable_session_id != session_id
+                or session.durable_owner_epoch != owner_epoch
+                or session.last_completed_response_id != response_id
+                or session.previous_response_alias_registration_generations.get(response_id) != registration_generation
+            ):
+                return
+            unregistered = await service._unregister_http_bridge_previous_response_id(
+                session,
+                response_id,
+                expected_durable_session_id=session_id,
+                expected_durable_owner_epoch=owner_epoch,
+            )
+            if unregistered is False:
+                return
+            session.last_completed_response_id = None
+            session.last_completed_response_account_id = None
+            session.last_completed_input_count = 0
+            session.last_completed_input_prefix_fingerprint = None
+            session.last_pending_tool_calls.clear()
+    except Exception:
+        # Preserve the public refusal and the abandonment fence. A later
+        # submission may retry retirement under the then-current owner.
+        logger.warning("Failed to retire locally abandoned HTTP bridge anchor", exc_info=True)
+
+
 async def _invalidate_denied_http_bridge_anchor(
     service: Any,
     session: "_HTTPBridgeSession",

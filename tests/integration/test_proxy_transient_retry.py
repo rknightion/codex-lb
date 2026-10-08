@@ -940,6 +940,92 @@ def _record_burst_backoff_sleeps(monkeypatch) -> list[float]:
 
 
 _NATIVE_CODEX_HEADERS = {"originator": "codex_cli_rs"}
+
+
+@pytest.mark.asyncio
+async def test_native_transport_abort_releases_only_stream_slot(async_client, app_instance, monkeypatch):
+    """A native normalizer abort must unwind the real retry lease owner."""
+    from sqlalchemy import select
+
+    from app.db.models import ApiKeyUsageReservation
+    from app.dependencies import get_proxy_service_for_app
+
+    account_id = await _import_account(async_client, "acc_native_cleanup", "nativecleanup@example.com")
+    settings_response = await async_client.get("/api/settings")
+    settings = settings_response.json()
+    settings["proxyAccountStreamLimit"] = 1
+    settings["proxyAccountStreamRecoveryReserve"] = 0
+    settings["apiKeyAuthEnabled"] = True
+    assert (await async_client.put("/api/settings", json=settings)).status_code == 200
+    key_response = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "native-cleanup",
+            "limits": [{"limitType": "total_tokens", "limitWindow": "weekly", "maxValue": 100000}],
+        },
+    )
+    assert key_response.status_code == 200
+    key = key_response.json()
+    headers = {**_NATIVE_CODEX_HEADERS, "Authorization": f"Bearer {key['key']}"}
+    service = get_proxy_service_for_app(app_instance)
+    calls = 0
+    closed = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        nonlocal calls
+        calls += 1
+        attempt = calls
+        try:
+            if attempt == 1:
+                yield _sse_event({"type": "response.created", "response": {"id": "resp_cleanup"}})
+                yield _sse_event(
+                    {
+                        "type": "response.failed",
+                        "_codex_lb_synthetic_transport_failure": True,
+                        "response": {
+                            "id": "resp_cleanup",
+                            "status": "failed",
+                            "error": {
+                                "code": "stream_incomplete",
+                                "message": "fixture transport failure",
+                            },
+                        },
+                    }
+                )
+            else:
+                yield _success_sse_event()
+        finally:
+            closed.append(attempt)
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+    payload = {"model": "gpt-5.1", "instructions": "hi", "input": [], "stream": True}
+    try:
+        await async_client.post("/backend-api/codex/responses", json=payload, headers=headers)
+    except ProxyResponseError:
+        pass  # Native transport failures deliberately retain their current terminal semantics.
+    assert (await service._load_balancer.account_pressure_snapshot(account_id))[1] == 0
+    assert closed == [1]
+    # ASGI aborts bypass the async_client response hook that normally drains persistence.
+    await service.drain_persistence_tasks(timeout_seconds=5)
+    async with SessionLocal() as session:
+        reservations = (
+            await session.scalars(select(ApiKeyUsageReservation).where(ApiKeyUsageReservation.api_key_id == key["id"]))
+        ).all()
+        assert len(reservations) == 1
+        assert reservations[0].status == "released"
+    response = await async_client.post("/backend-api/codex/responses", json=payload, headers=headers)
+    assert response.status_code == 200
+    assert any(event["type"] == "response.completed" for event in _extract_events(response.text.splitlines()))
+    assert calls == 2
+    assert closed == [1, 2]
+    assert (await service._load_balancer.account_pressure_snapshot(account_id))[1] == 0
+    async with SessionLocal() as session:
+        reservations = (
+            await session.scalars(select(ApiKeyUsageReservation).where(ApiKeyUsageReservation.api_key_id == key["id"]))
+        ).all()
+        assert sorted(reservation.status for reservation in reservations) == ["finalized", "released"]
+
+
 _BURST_OWNER_BOUND_PAYLOAD = {
     "model": "gpt-5.1",
     "instructions": "hi",

@@ -74,3 +74,7 @@ Source-qualified markers leave the legacy timestamp NULL, so an older binary
 safely restores conservative hard ownership during rollback. Dropping the scope
 column loses only restart-recovery state; it does not make the retained owner
 mobile.
+
+## Local continuity recovery follow-up
+
+A tombstone adopted after request planning can invalidate a proxy-injected anchor before dispatch. Retire only that matching durable/local carrier under owner and registration-generation fences. Preserve the public refusal and abandonment fence; do not claim upstream rejected a request never sent. A later full-history resend can establish replacement continuity while a delta remains protected.

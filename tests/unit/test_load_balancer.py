@@ -6537,3 +6537,21 @@ def test_background_recovery_state_from_account_follows_the_dashboard_soft_drain
     assert captured[-1]["routing_tunables"] is dashboard_tunables
     assert captured[0]["soft_drain_enabled"] is None
     assert captured[0]["routing_tunables"] is None
+
+
+@pytest.mark.parametrize("block", ["quota", "cooldown", "expired_auth"])
+def test_hard_owner_backoff_preserves_hard_gates(block: str):
+    now = 1_700_000_000.0
+    owner = AccountState("owner", AccountStatus.ACTIVE, error_count=5, last_error_at=now - 1)
+    if block == "quota":
+        owner.status = AccountStatus.QUOTA_EXCEEDED
+        owner.reset_at = now + 3600
+    elif block == "cooldown":
+        owner.cooldown_until = now + 60
+    else:
+        owner.status = AccountStatus.REAUTH_REQUIRED
+        owner.access_token_expires_at = now - 1
+    result = select_account([owner], now=now, hard_owner_pool=True)
+    assert result.account is None
+    assert owner.error_count == 5
+    assert owner.last_error_at == now - 1

@@ -19051,3 +19051,131 @@ async def test_smart_single_turn_stays_http_before_history_promotes(async_client
     assert len(upstreams) == 1
     assert "reason=smart_single_turn" in caplog.text
     assert "reason=smart_history" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_submit_time_abandonment_retires_anchor_before_full_history_retry(
+    async_client,
+    app_instance,
+    monkeypatch,
+):
+    """A tombstone adopted after planning cannot leave an injectable carrier."""
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(async_client, "acc_submit_abandon", "submit-abandon@example.com")
+    account = await _get_account(account_id)
+    upstream = _FakeBridgeUpstreamWebSocket()
+    _install_denied_anchor_bridge_fakes(monkeypatch, account=account, upstream=upstream)
+    service = get_proxy_service_for_app(app_instance)
+    headers = {"session_id": "submit-abandon-session"}
+    first_input, full_input = _denied_anchor_turn_inputs()
+    first = await async_client.post(
+        "/backend-api/codex/responses",
+        json={"model": "gpt-5.1", "instructions": "Return OK.", "input": first_input},
+        headers=headers,
+    )
+    assert first.status_code == 200
+    original_submit = service._submit_http_bridge_request
+    captured = []
+
+    async def adopt_tombstone_at_submit(session, **kwargs):
+        if not captured:
+            captured.append(session)
+            tombstone = http_bridge_retry_circuit_module._HTTPBridgeRetryCircuitState(
+                last_touched_monotonic=time.monotonic(),
+            )
+            tombstone.last_detail = "anchor_abandoned"
+            service._http_bridge_retry_circuits[session.key] = tombstone
+        return await original_submit(session, **kwargs)
+
+    monkeypatch.setattr(service, "_submit_http_bridge_request", adopt_tombstone_at_submit)
+    second = await async_client.post(
+        "/backend-api/codex/responses",
+        json={"model": "gpt-5.1", "instructions": "Return OK.", "input": full_input},
+        headers=headers,
+    )
+    assert second.status_code == 404, second.text
+    assert second.json()["error"]["code"] == "bridge_previous_response_not_found"
+    assert len(upstream.sent_text) == 1
+    retired = captured[0]
+    assert retired.last_completed_response_id is None
+    async with SessionLocal() as db:
+        row = await db.get(HttpBridgeSessionRecord, retired.durable_session_id)
+        assert row is not None and row.latest_response_id is None
+    assert not getattr(service, "_http_bridge_denied_anchor_fences", {})
+    assert service._http_bridge_retry_circuits[retired.key].last_detail == "anchor_abandoned"
+    delta = await async_client.post(
+        "/backend-api/codex/responses",
+        json={"model": "gpt-5.1", "instructions": "Return OK.", "input": "continue"},
+        headers=headers,
+    )
+    assert delta.status_code == 404, delta.text
+    assert len(upstream.sent_text) == 1
+    third = await async_client.post(
+        "/backend-api/codex/responses",
+        json={"model": "gpt-5.1", "instructions": "Return OK.", "input": full_input},
+        headers=headers,
+    )
+    assert third.status_code == 200, third.text
+    dispatched = json.loads(upstream.sent_text[-1])
+    assert dispatched.get("previous_response_id") is None
+    assert dispatched["input"] == full_input
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("successor", ["anchor", "owner"])
+async def test_abandoned_anchor_retirement_preserves_successor(
+    async_client,
+    app_instance,
+    monkeypatch,
+    successor,
+):
+    """A durable await cannot authorize deleting a newer local carrier."""
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(async_client, "acc_abandon_race", "abandon-race@example.com")
+    account = await _get_account(account_id)
+    upstream = _FakeBridgeUpstreamWebSocket()
+    _install_denied_anchor_bridge_fakes(monkeypatch, account=account, upstream=upstream)
+    service = get_proxy_service_for_app(app_instance)
+    first = await async_client.post(
+        "/backend-api/codex/responses",
+        json={"model": "gpt-5.1", "instructions": "Return OK.", "input": "first"},
+        headers={"session_id": "abandon-race"},
+    )
+    assert first.status_code == 200
+    session = next(iter(service._http_bridge_sessions.values()))
+    original_anchor = session.last_completed_response_id
+    original_epoch = session.durable_owner_epoch
+    real_clear = service._durable_bridge.clear_live_session_response_anchor_if_matches
+
+    async def clear_then_advance(**kwargs):
+        result = await real_clear(**kwargs)
+        assert result is not None
+        if successor == "owner":
+            async with SessionLocal() as db:
+                await db.execute(
+                    update(HttpBridgeSessionRecord)
+                    .where(
+                        HttpBridgeSessionRecord.id == session.durable_session_id,
+                    )
+                    .values(owner_epoch=original_epoch + 1, latest_response_id=original_anchor)
+                )
+                await db.commit()
+            session.durable_owner_epoch = original_epoch + 1
+        else:
+            assert await service._register_http_bridge_previous_response_id(session, "resp_successor")
+            session.last_completed_response_id = "resp_successor"
+        return result
+
+    monkeypatch.setattr(service._durable_bridge, "clear_live_session_response_anchor_if_matches", clear_then_advance)
+    await http_bridge_upstream_events_module._retire_abandoned_http_bridge_anchor(
+        service,
+        session,
+        response_id=original_anchor,
+    )
+    expected_anchor = original_anchor if successor == "owner" else "resp_successor"
+    assert session.last_completed_response_id == expected_anchor
+    assert expected_anchor in session.previous_response_ids
+    async with SessionLocal() as db:
+        row = await db.get(HttpBridgeSessionRecord, session.durable_session_id)
+        assert row is not None and row.latest_response_id == expected_anchor
+    assert not getattr(service, "_http_bridge_denied_anchor_fences", {})

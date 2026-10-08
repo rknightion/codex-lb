@@ -1087,7 +1087,7 @@ class _HTTPBridgeStreamingMixin:
             force_upstream_stream_transport = "http"
         if not runtime_config.enabled:
             stream_with_retry = cast(Callable[..., AsyncIterator[str]], self._stream_with_retry)
-            async for line in stream_with_retry(
+            retry_stream = stream_with_retry(
                 payload,
                 headers,
                 codex_session_affinity=codex_session_affinity,
@@ -1102,8 +1102,15 @@ class _HTTPBridgeStreamingMixin:
                 upstream_stream_transport_override=force_upstream_stream_transport,
                 client_ip=client_ip,
                 enforce_openai_sdk_contract=enforce_openai_sdk_contract,
-            ):
-                yield line
+            )
+            try:
+                async for line in retry_stream:
+                    yield line
+            finally:
+                with anyio.CancelScope(shield=True):
+                    close = getattr(retry_stream, "aclose", None)
+                    if callable(close):
+                        await close()
             return
 
         request_scope_id = ensure_request_scope_id()
@@ -1271,7 +1278,7 @@ class _HTTPBridgeStreamingMixin:
             request_id,
         )
         stream_with_retry = cast(Callable[..., AsyncIterator[str]], self._stream_with_retry)
-        async for line in stream_with_retry(
+        retry_stream = stream_with_retry(
             payload,
             headers,
             codex_session_affinity=codex_session_affinity,
@@ -1286,8 +1293,15 @@ class _HTTPBridgeStreamingMixin:
             upstream_stream_transport_override="http",
             client_ip=client_ip,
             enforce_openai_sdk_contract=enforce_openai_sdk_contract,
-        ):
-            yield line
+        )
+        try:
+            async for line in retry_stream:
+                yield line
+        finally:
+            with anyio.CancelScope(shield=True):
+                close = getattr(retry_stream, "aclose", None)
+                if callable(close):
+                    await close()
 
     async def _stream_via_http_bridge_impl(
         self: Any,
