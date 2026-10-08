@@ -83,3 +83,9 @@ reader failures or rejected-anchor 502s over five minutes every minute, threshol
 using the existing apps paging route. It excludes idle reader failures, counts events
 rather than unique requests, and does not monitor log-delivery freshness. Continuous
 firing follows the existing four-hour repeat policy. This branch is not published upstream.
+
+## Native queue overflow follow-up
+
+The two native queues share a public consumer-backpressure error. Pre-clear snapshots distinguish websocket_messages (64 messages) from helper_events (4096 events and 32MiB charged payload). Queue limits remain unchanged while measuring. Logs retain exact count, configured bounds, projected bytes, enqueue/dequeue counts and monotonic ages; bounded Prometheus histograms summarize overflow observations rather than current occupancy. Never-consumed gaps remain absent. Active streams include registered HTTP and websocket requests in one helper generation, not server-wide sessions. For example, count=64 with a very recent dequeue and young backlog suggests a burst; an old backlog and long dequeue gap suggests a delayed consumer. Neither proves CPU saturation. Payload-byte counts are not Python heap usage.
+
+The troubleshooting Grafana dashboard covers the union of source-defined and live codex_lb_ families, including families without samples, with log and trace drilldowns. Live metric availability is distinct from panel coverage.

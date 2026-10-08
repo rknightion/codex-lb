@@ -468,6 +468,11 @@ for line in sys.stdin:
 
 @pytest.mark.asyncio
 async def test_client_close_does_not_hang_when_stream_queue_is_full(tmp_path: Path) -> None:
+    from app.core.metrics.prometheus import REGISTRY
+
+    labels = {"queue": "helper_events", "limit": "bytes"}
+    metric = "codex_lb_native_queue_overflows_total"
+    before = (REGISTRY.get_sample_value(metric, labels) or 0) if REGISTRY is not None else None
     helper = tmp_path / "native-helper"
     _write_helper(
         helper,
@@ -511,9 +516,21 @@ for line in sys.stdin:
     healthy = await client.request(NativeEgressRequest(method="GET", url="https://example.test/healthy", headers={}))
 
     assert await asyncio.wait_for(healthy.read(), timeout=2.0) == b"ok"
-    with pytest.raises(NativeEgressTransportError, match="bounded event queue"):
+    with pytest.raises(NativeEgressTransportError, match="bounded event queue") as caught:
         await stalled.read()
+    diagnostic = caught.value.queue_diagnostic
+    assert diagnostic is not None
+    assert diagnostic.name == "helper_events"
+    assert diagnostic.queued_bytes + diagnostic.rejected_bytes == diagnostic.projected_bytes
+    assert diagnostic.queued_bytes <= diagnostic.byte_limit < diagnostic.projected_bytes
+    assert diagnostic.count < diagnostic.count_limit
+    assert diagnostic.active_streams >= 1
+    assert diagnostic.oldest_age_ms >= 0
+    assert diagnostic.dequeued >= 1
+    assert diagnostic.last_dequeue_ms is not None
 
+    if REGISTRY is not None:
+        assert REGISTRY.get_sample_value(metric, labels) == before + 1
     await asyncio.wait_for(client.aclose(), timeout=2.0)
 
 
@@ -1164,7 +1181,11 @@ for line in sys.stdin:
         await client.aclose()
 
 
-def test_bounded_event_queue_trips_on_bytes_or_events_and_releases_bytes_on_get() -> None:
+def test_bounded_event_queue_trips_on_bytes_or_events_and_releases_bytes_on_get(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    tick = 1.0
+    monkeypatch.setattr(native_egress_module, "REAL_CLOCK", SimpleNamespace(monotonic=lambda: tick))
     queue = native_egress_module._BoundedEventQueue(max_events=4, max_bytes=10)
     queue.put_nowait({"type": "chunk", "data": "abcd"})
     queue.put_nowait({"type": "sse", "text": "efgh"})
@@ -1179,7 +1200,20 @@ def test_bounded_event_queue_trips_on_bytes_or_events_and_releases_bytes_on_get(
     assert queue.full()  # ...and 4 events is the event cap.
     with pytest.raises(asyncio.QueueFull):
         queue.put_nowait({"type": "cancelled"})
+    tick = 3.0
     assert queue.get_nowait() == {"type": "chunk", "data": "abcd"}
+    tick = 4.0
+    snapshot = queue.observations.snapshot(
+        name="helper_events",
+        count_limit=4,
+        byte_limit=10,
+        rejected_bytes=5,
+        active_streams=2,
+    )
+    assert snapshot.oldest_age_ms == 3000
+    assert snapshot.last_dequeue_ms == 1000
+    assert snapshot.enqueued == 4 and snapshot.dequeued == 1
+    assert snapshot.count == 3 and snapshot.queued_bytes == 6 and snapshot.projected_bytes == 11
     assert queue.queued_bytes == 6 and not queue.full()
     with pytest.raises(asyncio.QueueFull):
         queue.put_nowait({"type": "chunk", "data": "wxyz!"})  # 6 + 5 > 10
@@ -1398,5 +1432,70 @@ async def test_interpreted_sse_rejects_invalid_metadata_without_replay(
                 pass
         assert client._request_sequence == 1
         assert not client._streams
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_native_websocket_overflow_logs_queue_snapshot(tmp_path: Path, caplog) -> None:
+    from app.core.clients.proxy_websocket import NativeUpstreamWebSocket
+    from app.core.metrics.prometheus import REGISTRY
+
+    labels = {"queue": "websocket_messages", "limit": "count"}
+    metric = "codex_lb_native_queue_overflows_total"
+    before = (REGISTRY.get_sample_value(metric, labels) or 0) if REGISTRY is not None else None
+    helper = tmp_path / "native-helper"
+    _write_helper(
+        helper,
+        """#!/usr/bin/env python3
+import json
+import sys
+for line in sys.stdin:
+    command = json.loads(line)
+    request_id = command["request_id"]
+    if command["type"] == "websocket_connect":
+        print(json.dumps({"type": "websocket_open", "request_id": request_id,
+                          "status": 101, "headers": []}), flush=True)
+        for index in range(65):
+            print(json.dumps({"type": "websocket_text", "request_id": request_id, "text": "private-é"}), flush=True)
+    elif command["type"] == "cancel":
+        print(json.dumps({"type": "cancelled", "request_id": request_id}), flush=True)
+""",
+    )
+    client = SubprocessNativeEgressClient(helper)
+    try:
+        native = await client.websocket(
+            NativeWebSocketRequest(
+                url="wss://example.test/responses",
+                headers={},
+                connect_timeout_seconds=2,
+                max_message_bytes=1024,
+            )
+        )
+        adapter = NativeUpstreamWebSocket(native)
+        await asyncio.wait_for(asyncio.shield(native._pump_task), timeout=2)
+        with caplog.at_level("WARNING"):
+            result = await adapter.receive()
+        assert result.kind == "error"
+        assert result.diagnostic_connection_id == adapter.diagnostic_connection_id
+        message = next(record.message for record in caplog.records if "native_websocket_terminal" in record.message)
+        for field in [
+            "queue_name=websocket_messages",
+            "queue_count=64",
+            "queue_count_limit=64",
+            "queue_bytes=640",
+            "queue_byte_limit=None",
+            "queue_rejected_bytes=10",
+            "queue_projected_bytes=650",
+            "queue_enqueued=64",
+            "queue_dequeued=0",
+            "queue_last_dequeue_ms=None",
+            "queue_active_streams=1",
+        ]:
+            assert field in message
+        assert "queue_oldest_age_ms=" in message
+        assert "private" not in message
+        if REGISTRY is not None:
+            assert REGISTRY.get_sample_value(metric, labels) == before + 1
     finally:
         await client.aclose()

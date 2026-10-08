@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import builtins
 import importlib
 import sys
 import types
@@ -39,6 +38,7 @@ class _MetricBase:
         labelnames: list[str] | None = None,
         registry=None,
         multiprocess_mode: str | None = None,
+        buckets: tuple[float, ...] | None = None,
     ) -> None:
         self.name = name
         self.documentation = documentation
@@ -111,15 +111,8 @@ def _load_metrics_modules(
     if prometheus_client_module is not None:
         monkeypatch.setitem(sys.modules, "prometheus_client", prometheus_client_module)
     else:
-        monkeypatch.delitem(sys.modules, "prometheus_client", raising=False)
-        real_import = builtins.__import__
-
-        def _missing_prometheus_import(name, globals=None, locals=None, fromlist=(), level=0):
-            if name == "prometheus_client":
-                raise ImportError("prometheus_client is not installed")
-            return real_import(name, globals, locals, fromlist, level)
-
-        monkeypatch.setattr(builtins, "__import__", _missing_prometheus_import)
+        # import_module bypasses builtins.__import__; block the actual module lookup.
+        monkeypatch.setitem(sys.modules, "prometheus_client", None)
 
     prometheus_module = importlib.import_module("app.core.metrics.prometheus")
     middleware_module = importlib.import_module("app.core.metrics.middleware")
@@ -365,3 +358,86 @@ def test_bridge_instance_mismatch_counter_noop_without_prometheus(monkeypatch: p
 
     assert prometheus_module.PROMETHEUS_AVAILABLE is False
     assert prometheus_module.bridge_instance_mismatch_total is None
+
+
+def test_native_queue_overflow_prometheus_exposition(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = pytest.importorskip("prometheus_client")
+    from prometheus_client.parser import text_string_to_metric_families
+
+    metrics, _ = _load_metrics_modules(monkeypatch, prometheus_client_module=client)
+    metrics.record_native_queue_overflow(
+        queue="websocket_messages",
+        limit="count",
+        count=64,
+        queued_bytes=4096,
+        oldest_age_ms=250,
+        last_dequeue_ms=125,
+        active_streams=8,
+    )
+    metrics.record_native_queue_overflow(
+        queue="helper_events",
+        limit="bytes",
+        count=2,
+        queued_bytes=8192,
+        oldest_age_ms=None,
+        last_dequeue_ms=None,
+        active_streams=3,
+    )
+    before_invalid = client.generate_latest(metrics.REGISTRY)
+    metrics.record_native_queue_overflow(
+        queue="request-id-must-not-be-a-label",  # type: ignore[arg-type]
+        limit="count",
+        count=1,
+        queued_bytes=1,
+        oldest_age_ms=None,
+        last_dequeue_ms=None,
+        active_streams=1,
+    )
+    assert client.generate_latest(metrics.REGISTRY) == before_invalid
+    samples = {
+        (s.name, tuple(sorted(s.labels.items()))): s.value
+        for family in text_string_to_metric_families(client.generate_latest(metrics.REGISTRY).decode())
+        for s in family.samples
+    }
+
+    def value(name: str, **labels: str) -> float:
+        return samples[("codex_lb_native_queue_" + name, tuple(sorted(labels.items())))]
+
+    assert value("overflows_total", queue="websocket_messages", limit="count") == 1
+    assert value("overflows_total", queue="helper_events", limit="bytes") == 1
+    assert value("overflow_items_sum", queue="websocket_messages") == 64
+    assert value("overflow_bytes_sum", queue="websocket_messages") == 4096
+    assert value("overflow_oldest_age_seconds_sum", queue="websocket_messages") == 0.25
+    assert value("overflow_consumer_gap_seconds_sum", queue="websocket_messages") == 0.125
+    assert value("overflow_active_streams_sum", queue="websocket_messages") == 8
+    assert not any(
+        name.endswith("oldest_age_seconds_count") and ("queue", "helper_events") in labels for name, labels in samples
+    )
+
+
+def test_native_queue_overflow_diagnostics_cannot_raise(monkeypatch: pytest.MonkeyPatch) -> None:
+    metrics, _ = _load_metrics_modules(monkeypatch, prometheus_client_module=_fake_prometheus_client_module())
+
+    def fail(**labels: str) -> None:
+        raise RuntimeError("broken collector")
+
+    monkeypatch.setattr(metrics.native_queue_overflows_total, "labels", fail)
+    metrics.record_native_queue_overflow(
+        queue="websocket_messages",
+        limit="count",
+        count=64,
+        queued_bytes=4096,
+        oldest_age_ms=None,
+        last_dequeue_ms=None,
+        active_streams=8,
+    )
+    metrics, _ = _load_metrics_modules(monkeypatch, prometheus_client_module=None)
+    metrics.record_native_queue_overflow(
+        queue="helper_events",
+        limit="bytes",
+        count=64,
+        queued_bytes=4096,
+        oldest_age_ms=None,
+        last_dequeue_ms=None,
+        active_streams=8,
+    )

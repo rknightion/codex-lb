@@ -8,15 +8,18 @@ import logging
 import math
 import os
 import shutil
+from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 
 from multidict import CIMultiDict
 
 from app.core.clients.stream_errors import StreamEventTooLargeError, StreamIdleTimeoutError
+from app.core.clock import REAL_CLOCK
+from app.core.metrics.prometheus import record_native_queue_overflow
 from app.core.types import JsonValue
 from app.core.utils.shared_future import _await_cleanup_deferring_cancellation
 
@@ -83,6 +86,80 @@ def _event_payload_size(item: object) -> int:
     return 0
 
 
+@dataclass(frozen=True, slots=True)
+class NativeQueueDiagnostic:
+    name: Literal["websocket_messages", "helper_events"]
+    count: int
+    count_limit: int
+    queued_bytes: int
+    byte_limit: int | None
+    rejected_bytes: int
+    projected_bytes: int
+    enqueued: int
+    dequeued: int
+    oldest_age_ms: int | None
+    last_dequeue_ms: int | None
+    active_streams: int
+
+    def record_metrics(self, limit: Literal["count", "bytes"]) -> None:
+        record_native_queue_overflow(
+            queue=self.name,
+            limit=limit,
+            count=self.count,
+            queued_bytes=self.queued_bytes,
+            oldest_age_ms=self.oldest_age_ms,
+            last_dequeue_ms=self.last_dequeue_ms,
+            active_streams=self.active_streams,
+        )
+
+
+class _QueueObservations:
+    """Bounded metadata only; byte counts describe payloads, not heap usage."""
+
+    def __init__(self) -> None:
+        self.items: deque[tuple[float, int]] = deque()
+        self.queued_bytes = 0
+        self.enqueued = 0
+        self.dequeued = 0
+        self.last_dequeue: float | None = None
+
+    def put(self, size: int) -> None:
+        self.items.append((REAL_CLOCK.monotonic(), size))
+        self.queued_bytes += size
+        self.enqueued += 1
+
+    def get(self) -> None:
+        _, size = self.items.popleft()
+        self.queued_bytes -= size
+        self.dequeued += 1
+        self.last_dequeue = REAL_CLOCK.monotonic()
+
+    def snapshot(
+        self,
+        *,
+        name: Literal["websocket_messages", "helper_events"],
+        count_limit: int,
+        byte_limit: int | None,
+        rejected_bytes: int,
+        active_streams: int,
+    ) -> NativeQueueDiagnostic:
+        now = REAL_CLOCK.monotonic()
+        return NativeQueueDiagnostic(
+            name=name,
+            count=len(self.items),
+            count_limit=count_limit,
+            queued_bytes=self.queued_bytes,
+            byte_limit=byte_limit,
+            rejected_bytes=rejected_bytes,
+            projected_bytes=self.queued_bytes + rejected_bytes,
+            enqueued=self.enqueued,
+            dequeued=self.dequeued,
+            oldest_age_ms=max(0, int((now - self.items[0][0]) * 1000)) if self.items else None,
+            last_dequeue_ms=max(0, int((now - self.last_dequeue) * 1000)) if self.last_dequeue is not None else None,
+            active_streams=active_streams,
+        )
+
+
 class _BoundedEventQueue(asyncio.Queue[dict[str, object] | BaseException]):
     """``asyncio.Queue`` whose ``full()`` also trips on a queued-bytes budget.
 
@@ -94,7 +171,11 @@ class _BoundedEventQueue(asyncio.Queue[dict[str, object] | BaseException]):
     def __init__(self, *, max_events: int, max_bytes: int) -> None:
         super().__init__(maxsize=max_events)
         self._max_bytes = max_bytes
-        self.queued_bytes = 0
+        self.observations = _QueueObservations()
+
+    @property
+    def queued_bytes(self) -> int:
+        return self.observations.queued_bytes
 
     def put_nowait(self, item: dict[str, object] | BaseException) -> None:
         # The byte budget is enforced against the projected total, so a queue
@@ -111,11 +192,11 @@ class _BoundedEventQueue(asyncio.Queue[dict[str, object] | BaseException]):
 
     def _put(self, item: dict[str, object] | BaseException) -> None:
         super()._put(item)
-        self.queued_bytes += _event_payload_size(item)
+        self.observations.put(_event_payload_size(item))
 
     def _get(self) -> dict[str, object] | BaseException:
         item = super()._get()
-        self.queued_bytes -= _event_payload_size(item)
+        self.observations.get()
         return item
 
 
@@ -213,6 +294,7 @@ class NativeEgressTransportError(NativeEgressError):
         headers: tuple[tuple[str, str], ...] = (),
         body: bytes | None = None,
         diagnostic: NativeWebSocketDiagnostic | None = None,
+        queue_diagnostic: NativeQueueDiagnostic | None = None,
     ) -> None:
         super().__init__(message)
         self.failure_phase = failure_phase
@@ -222,6 +304,7 @@ class NativeEgressTransportError(NativeEgressError):
         self.headers = headers
         self.body = body
         self.diagnostic = diagnostic or NativeWebSocketDiagnostic()
+        self.queue_diagnostic = queue_diagnostic
 
 
 @dataclass(frozen=True, slots=True)
@@ -519,6 +602,7 @@ class NativeEgressWebSocket:
         self._messages: asyncio.Queue[NativeWebSocketMessage | BaseException] = asyncio.Queue(
             maxsize=_NATIVE_WEBSOCKET_MESSAGE_QUEUE_LIMIT
         )
+        self._message_observations = _QueueObservations()
         self._pending: dict[str, asyncio.Future[None]] = {}
         self._command_sequence = 0
         self._completed = False
@@ -553,6 +637,7 @@ class NativeEgressWebSocket:
         item = await self._messages.get()
         if isinstance(item, BaseException):
             raise item
+        self._message_observations.get()
         return item
 
     async def close(self, code: int = 1000, reason: str = "") -> None:
@@ -758,15 +843,32 @@ class NativeEgressWebSocket:
             self._finish()
 
     def _queue_message(self, message: NativeWebSocketMessage) -> None:
+        size = (
+            len(message.text.encode("utf-8", errors="surrogatepass"))
+            if message.text is not None
+            else len(message.data or b"")
+        )
         try:
             self._messages.put_nowait(message)
+            self._message_observations.put(size)
         except asyncio.QueueFull as exc:
+            snapshot = self._message_observations.snapshot(
+                name="websocket_messages",
+                count_limit=self._messages.maxsize,
+                byte_limit=None,
+                rejected_bytes=size,
+                active_streams=self._client._active_stream_count(self._generation),
+            )
+            snapshot.record_metrics("count")
             while not self._messages.empty():
                 with contextlib.suppress(asyncio.QueueEmpty):
                     self._messages.get_nowait()
+            self._message_observations.items.clear()
+            self._message_observations.queued_bytes = 0
             raise NativeEgressTransportError(
                 "native websocket consumer exceeded the bounded message queue",
                 failure_phase="consumer_backpressure",
+                queue_diagnostic=snapshot,
             ) from exc
 
     def _queue_terminal(self, failure: BaseException) -> None:
@@ -1131,6 +1233,9 @@ class SubprocessNativeEgressClient:
             except (BrokenPipeError, ConnectionResetError) as exc:
                 raise NativeEgressTransportError("native helper closed during command dispatch") from exc
 
+    def _active_stream_count(self, generation: int) -> int:
+        return sum(stream_generation == generation for stream_generation, _ in self._streams.values())
+
     async def _read_process(self, process: asyncio.subprocess.Process, generation: int) -> None:
         stdout = process.stdout
         if stdout is None:
@@ -1157,9 +1262,26 @@ class SubprocessNativeEgressClient:
                     # a stalled consumer still hits the bounded queue.
                     await asyncio.sleep(0)
                 except asyncio.QueueFull:
+                    snapshot = None
+                    if isinstance(events, _BoundedEventQueue):
+                        snapshot = events.observations.snapshot(
+                            name="helper_events",
+                            count_limit=events.maxsize,
+                            byte_limit=events._max_bytes,
+                            rejected_bytes=_event_payload_size(event),
+                            active_streams=self._active_stream_count(generation),
+                        )
+                        # Match put_nowait's byte precheck, which precedes the count check.
+                        byte_overflow = (
+                            snapshot.rejected_bytes > 0
+                            and snapshot.count > 0
+                            and snapshot.projected_bytes > events._max_bytes
+                        )
+                        snapshot.record_metrics("bytes" if byte_overflow else "count")
                     overflow_failure = NativeEgressTransportError(
                         "native stream consumer exceeded the bounded event queue",
                         failure_phase="consumer_backpressure",
+                        queue_diagnostic=snapshot,
                     )
                     self._finish_request(request_id, generation, events)
                     while not events.empty():

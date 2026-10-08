@@ -549,6 +549,7 @@ class NativeUpstreamWebSocket:
         origin = "local_cleanup" if self._local_close_requested else "peer_close" if exc is None else "unknown"
         if exc is not None and exc.diagnostic_origin in {"helper_stdout_eof", "helper_protocol"}:
             origin = exc.diagnostic_origin
+        queue = exc.queue_diagnostic if isinstance(exc, NativeEgressTransportError) else None
         # Application-message observations at this adapter, not TCP reads or
         # ping/pong timestamps. No raw exception, response, URL or close reason.
         logger.warning(
@@ -557,7 +558,10 @@ class NativeUpstreamWebSocket:
             "operation=%s protocol=%s io_kind=%s os_code=%s tls=%s close_code=%s "
             "lifetime_ms=%d last_application_send_ms=%s last_application_receive_ms=%s "
             "sent_messages=%d received_messages=%d origin=%s helper_returncode_before_cleanup=%s "
-            "helper_cleanup_requested=%s",
+            "helper_cleanup_requested=%s queue_name=%s queue_count=%s queue_count_limit=%s "
+            "queue_bytes=%s queue_byte_limit=%s queue_rejected_bytes=%s queue_projected_bytes=%s "
+            "queue_enqueued=%s queue_dequeued=%s queue_oldest_age_ms=%s queue_last_dequeue_ms=%s "
+            "queue_active_streams=%s",
             self.diagnostic_connection_id,
             request_id,
             generation,
@@ -580,6 +584,18 @@ class NativeUpstreamWebSocket:
             origin,
             exc.helper_returncode_before_cleanup if exc is not None else None,
             exc.helper_cleanup_requested if exc is not None else None,
+            queue.name if queue is not None else None,
+            queue.count if queue is not None else None,
+            queue.count_limit if queue is not None else None,
+            queue.queued_bytes if queue is not None else None,
+            queue.byte_limit if queue is not None else None,
+            queue.rejected_bytes if queue is not None else None,
+            queue.projected_bytes if queue is not None else None,
+            queue.enqueued if queue is not None else None,
+            queue.dequeued if queue is not None else None,
+            queue.oldest_age_ms if queue is not None else None,
+            queue.last_dequeue_ms if queue is not None else None,
+            queue.active_streams if queue is not None else None,
         )
 
 

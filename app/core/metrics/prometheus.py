@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from importlib import import_module
-from typing import Protocol
+from typing import Literal, Protocol
 
 
 class CollectorRegistryLike(Protocol):
@@ -440,6 +440,48 @@ if PROMETHEUS_AVAILABLE:
         registry=REGISTRY,
     )
 
+    native_queue_overflows_total = Counter(
+        "codex_lb_native_queue_overflows_total",
+        "Native queue overflows by queue and rejected limit",
+        ["queue", "limit"],
+        registry=REGISTRY,
+    )
+    native_queue_overflow_items = Histogram(
+        "codex_lb_native_queue_overflow_items",
+        "Queued items at native queue overflow",
+        ["queue"],
+        buckets=(1, 4, 16, 32, 64, 128, 256, 1024),
+        registry=REGISTRY,
+    )
+    native_queue_overflow_bytes = Histogram(
+        "codex_lb_native_queue_overflow_bytes",
+        "Queued payload bytes excluding the rejected item at native queue overflow",
+        ["queue"],
+        buckets=(1024, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864),
+        registry=REGISTRY,
+    )
+    native_queue_overflow_oldest_age_seconds = Histogram(
+        "codex_lb_native_queue_overflow_oldest_age_seconds",
+        "Oldest queued item age at native queue overflow; unknown ages omitted",
+        ["queue"],
+        buckets=(0.001, 0.01, 0.1, 0.5, 1, 5, 30, 120),
+        registry=REGISTRY,
+    )
+    native_queue_overflow_consumer_gap_seconds = Histogram(
+        "codex_lb_native_queue_overflow_consumer_gap_seconds",
+        "Time since last dequeue at native queue overflow; unknown gaps omitted",
+        ["queue"],
+        buckets=(0.001, 0.01, 0.1, 0.5, 1, 5, 30, 120),
+        registry=REGISTRY,
+    )
+    native_queue_overflow_active_streams = Histogram(
+        "codex_lb_native_queue_overflow_active_streams",
+        "Active streams in the owning helper generation at native queue overflow",
+        ["queue"],
+        buckets=(1, 2, 4, 8, 16, 32, 64, 128, 256),
+        registry=REGISTRY,
+    )
+
     def make_scrape_registry() -> CollectorRegistryLike:
         if MULTIPROCESS_MODE:
             _multiprocess = import_module("prometheus_client.multiprocess")
@@ -523,6 +565,13 @@ else:
     model_source_bulkhead_in_flight: GaugeLike | None = None
     model_source_usage_estimated_total: CounterLike | None = None
 
+    native_queue_overflows_total: CounterLike | None = None
+    native_queue_overflow_items: HistogramLike | None = None
+    native_queue_overflow_bytes: HistogramLike | None = None
+    native_queue_overflow_oldest_age_seconds: HistogramLike | None = None
+    native_queue_overflow_consumer_gap_seconds: HistogramLike | None = None
+    native_queue_overflow_active_streams: HistogramLike | None = None
+
     def make_scrape_registry() -> None:
         return None
 
@@ -530,7 +579,49 @@ else:
         pass
 
 
+def record_native_queue_overflow(
+    *,
+    queue: Literal["websocket_messages", "helper_events"],
+    limit: Literal["count", "bytes"],
+    count: int,
+    queued_bytes: int,
+    oldest_age_ms: float | None,
+    last_dequeue_ms: float | None,
+    active_streams: int,
+) -> None:
+    """Record bounded overflow snapshots without affecting transport outcomes."""
+    if (
+        not PROMETHEUS_AVAILABLE
+        or queue not in ("websocket_messages", "helper_events")
+        or limit not in ("count", "bytes")
+    ):
+        return
+    try:
+        if native_queue_overflows_total is not None:
+            native_queue_overflows_total.labels(queue=queue, limit=limit).inc()
+        observations = (
+            (native_queue_overflow_items, count),
+            (native_queue_overflow_bytes, queued_bytes),
+            (native_queue_overflow_active_streams, active_streams),
+            (native_queue_overflow_oldest_age_seconds, None if oldest_age_ms is None else oldest_age_ms / 1000),
+            (native_queue_overflow_consumer_gap_seconds, None if last_dequeue_ms is None else last_dequeue_ms / 1000),
+        )
+        for metric, value in observations:
+            if metric is not None and value is not None:
+                metric.labels(queue=queue).observe(value)
+    except Exception:
+        # Telemetry must not replace the original queue failure, even if a collector breaks.
+        pass
+
+
 __all__ = [
+    "record_native_queue_overflow",
+    "native_queue_overflows_total",
+    "native_queue_overflow_items",
+    "native_queue_overflow_bytes",
+    "native_queue_overflow_oldest_age_seconds",
+    "native_queue_overflow_consumer_gap_seconds",
+    "native_queue_overflow_active_streams",
     "MULTIPROCESS_MODE",
     "PROMETHEUS_AVAILABLE",
     "REGISTRY",
