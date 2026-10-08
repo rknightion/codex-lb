@@ -1,0 +1,6 @@
+# Verification and limits
+Hard-owner selection:402focused tests plus existing concurrent-health control; three public routes failed before the fix. Anchor retirement:14focused tests, including404/no dispatch followed by delta refusal and full-history success, plus successor-generation mutation witnesses. Cleanup:147API/transient tests and10native terminal controls; real cap-one route showed leaked stream occupancy before correction and successful next request after correction. Integrated final gate549passed. Cleanup helper extraction four route controls passed; architecture and timing passed without changing limits. All67main specs validate.
+
+Actual pi1.0.4 AgentSession through TCP/candidateproxy/fakeupstream:13casespass, including one executed tool across retry, quota replacement, owner-backoff retention, protected and partial-output refusal, and settled account leases. Literal close then anchored replay then anchor rejection remains an ambiguous-replay refusal and is intentionally not claimed recovered.
+
+CodeRabbit reviewed15changed application/test files across primary and helper-extraction reviews,0findings. Deployedf1d08175169adc7e9ef4f0b3895e8da89023c5b2 via Camden updater; healthy,no schema drift,10application hashes match. Early live sample11success/1stream_incomplete; upstream failures remain possible.

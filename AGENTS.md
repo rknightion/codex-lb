@@ -160,3 +160,5 @@ after their durable owner becomes unavailable beyond the request budget. This de
 loses earlier upstream context; Rob accepted it because loop goals live on disk. Explicit
 client anchors and account-bound files remain protected. Conversation archives are not
 automatically replayed. Keep retry-circuit and quarantine generation fences intact.
+
+Responses generator wrappers own cascading closure of their delegated streams. Preserve same-task cleanup and the native terminal classification; otherwise a failed response can retain an account stream lease until garbage collection.
