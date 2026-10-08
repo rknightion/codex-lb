@@ -154,3 +154,9 @@ Camden deployment uses `/opt/codex-lb/update.sh --sha <exact-local-commit>` afte
 the commit into `/opt/codex-lb/src`. The updater resets and cleans its checkout: verify it
 is clean and unused first. Its automatic dump rotation deletes beyond ten files; archive
 any dumps that would be rotated before invoking it. Retain the previous image and SHA.
+
+The local recovery build allows portable, originally unanchored requests to fresh-start
+after their durable owner becomes unavailable beyond the request budget. This deliberately
+loses earlier upstream context; Rob accepted it because loop goals live on disk. Explicit
+client anchors and account-bound files remain protected. Conversation archives are not
+automatically replayed. Keep retry-circuit and quarantine generation fences intact.
