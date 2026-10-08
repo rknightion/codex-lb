@@ -56,7 +56,10 @@ _NATIVE_EVENT_LINE_LIMIT = 24 * 1024 * 1024
 # the shared reader hostage.
 _NATIVE_STREAM_QUEUE_LIMIT = 4096
 _NATIVE_STREAM_QUEUE_BYTES_LIMIT = 32 * 1024 * 1024
-_NATIVE_WEBSOCKET_MESSAGE_QUEUE_LIMIT = 64
+# Match the helper budget: a short scheduling delay must not reject tiny deltas.
+_NATIVE_WEBSOCKET_MESSAGE_QUEUE_LIMIT = 4096
+_NATIVE_WEBSOCKET_MESSAGE_QUEUE_BYTES_LIMIT = 32 * 1024 * 1024
+_NATIVE_WEBSOCKET_PUMP_BATCH = 32
 _NATIVE_CANCEL_TIMEOUT_SECONDS = 2.0
 _NATIVE_WEBSOCKET_COMMAND_TIMEOUT_SECONDS = 30.0
 
@@ -729,9 +732,16 @@ class NativeEgressWebSocket:
 
     async def _pump(self) -> None:
         terminal_failure: BaseException | None = None
+        processed = 0
         try:
             while True:
+                if processed == _NATIVE_WEBSOCKET_PUMP_BATCH:
+                    # get() does not yield while buffered. Share a scheduling turn
+                    # without blocking on the consumer: send ACKs use this pump too.
+                    await asyncio.sleep(0)
+                    processed = 0
                 item = await self._events.get()
+                processed += 1
                 if isinstance(item, BaseException):
                     terminal_failure = item
                     return
@@ -848,18 +858,27 @@ class NativeEgressWebSocket:
             if message.text is not None
             else len(message.data or b"")
         )
+        if message.responses_interpreted:
+            # The IPC representation retains the original text and parsed JSON.
+            size *= 2
+        limit: Literal["count", "bytes"] = "count"
         try:
+            if not self._messages.full() and (
+                self._message_observations.queued_bytes + size > _NATIVE_WEBSOCKET_MESSAGE_QUEUE_BYTES_LIMIT
+            ):
+                limit = "bytes"
+                raise asyncio.QueueFull
             self._messages.put_nowait(message)
             self._message_observations.put(size)
         except asyncio.QueueFull as exc:
             snapshot = self._message_observations.snapshot(
                 name="websocket_messages",
                 count_limit=self._messages.maxsize,
-                byte_limit=None,
+                byte_limit=_NATIVE_WEBSOCKET_MESSAGE_QUEUE_BYTES_LIMIT,
                 rejected_bytes=size,
                 active_streams=self._client._active_stream_count(self._generation),
             )
-            snapshot.record_metrics("count")
+            snapshot.record_metrics(limit)
             while not self._messages.empty():
                 with contextlib.suppress(asyncio.QueueEmpty):
                     self._messages.get_nowait()

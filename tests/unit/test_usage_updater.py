@@ -1828,7 +1828,7 @@ async def test_usage_refresh_recovers_quota_exceeded_free_weekly_account(monkeyp
 
     await updater.refresh_accounts([account], latest_usage={})
 
-    assert account.status == AccountStatus.QUOTA_EXCEEDED
+    assert account.status == AccountStatus.ACTIVE
     assert usage_repo.entries[-1].window == "primary"
 
 
@@ -5375,3 +5375,64 @@ async def test_requested_refresh_registers_owned_lane_before_first_suspension(
     await requested
     assert lookups == [stored_account.id]
     assert usage_updater_module._USAGE_REFRESH_SINGLEFLIGHT._inflight == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("credits", [None, {"has_credits": True, "balance": "1.0"}])
+async def test_refresh_reconciles_exhausted_weekly_reset_without_overriding_credits(monkeypatch, credits) -> None:
+    now = int(time.time())
+    weekly_reset = now + 7 * 86400
+    used_percent = 100.0
+
+    async def fetch(**kwargs):
+        return UsagePayload.model_validate(
+            {
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": used_percent,
+                        "reset_at": weekly_reset,
+                        "limit_window_seconds": 7 * 86400,
+                    }
+                },
+                "credits": credits,
+            }
+        )
+
+    monkeypatch.setattr(usage_updater_module, "fetch_usage", fetch)
+    repo = StubAccountsRepository()
+    updater = UsageUpdater(StubUsageRepository(return_rows=True), accounts_repo=repo)
+    account = _make_account("weekly_exhausted", "workspace_shared")
+    account.status = AccountStatus.RATE_LIMITED
+    account.blocked_at = now
+    account.reset_at = now + 30
+    repo.accounts_by_id[account.id] = account
+    await updater.refresh_accounts([account], latest_usage={})
+    assert account.status == (AccountStatus.QUOTA_EXCEEDED if credits is None else AccountStatus.RATE_LIMITED)
+    assert account.blocked_at == now
+    assert account.reset_at == (weekly_reset if credits is None else now + 30)
+
+    if credits is None:
+        used_percent = 10.0
+        account.blocked_at = now - 121
+        await updater.force_refresh(account)
+        assert account.status == AccountStatus.ACTIVE
+        assert account.reset_at is None
+
+
+@pytest.mark.asyncio
+async def test_exhausted_short_window_does_not_shorten_actual_throttle() -> None:
+    now = int(time.time())
+    account = _make_account("short-throttle", "workspace_shared")
+    account.status = AccountStatus.RATE_LIMITED
+    account.blocked_at = now - 180
+    account.reset_at = now + 3600
+    repo = StubAccountsRepository()
+    repo.accounts_by_id[account.id] = account
+    updater = UsageUpdater(StubUsageRepository(), accounts_repo=repo)
+    primary = usage_updater_module.UsageWindow(used_percent=100, reset_at=now + 600, limit_window_seconds=18000)
+    secondary = usage_updater_module.UsageWindow(used_percent=10, reset_at=now + 86400, limit_window_seconds=604800)
+    await updater._reconcile_exhausted_reset(account, windows=(primary, secondary, None), now_epoch=now)
+    await updater._recover_quota_status_from_usage(account, primary=primary, secondary=secondary)
+    assert account.status == AccountStatus.RATE_LIMITED
+    assert account.reset_at == now + 3600
+    assert account.blocked_at == now - 180

@@ -1,0 +1,7 @@
+# Context
+
+The incident combines a weekly 100% usage observation and repeated 30-second error cooldowns. Successful refresh previously stored the usage row without reconciling account reset markers. The new reconciliation only acts on already-blocked accounts, standard windows, valid future deadlines, and no usable credits. Long-window exhaustion uses quota-exceeded status so a subsequent fresh available observation can recover through the existing cooldown policy. Short-window-only exhaustion retains rate-limited status, and quota evidence cannot shorten a later actual throttle deadline. Additional model-specific quotas do not change global status.
+
+Both 429 writers compare the original status markers when persisting and preserve a valid blocked horizon. A CAS miss restores the pre-write local runtime state; cache invalidation forces the next selection to reload authoritative state. Runtime is provisionally updated before persistence so concurrent selection remains blocked until the write completes.
+
+The existing test `test_usage_refresh_recovers_quota_exceeded_free_weekly_account` previously asserted that the account remained quota-exceeded despite its name. Its expectation intentionally changes to active: recovery now recognizes the weekly duration even when upstream puts it in the primary slot, matching selection's quota interpretation. A new refresh-boundary test reproduces the previous short-reset bug, then verifies exhausted-to-available recovery and credits bypass.

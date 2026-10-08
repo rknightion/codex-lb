@@ -1,0 +1,4 @@
+## Decision
+The operator explicitly authorized losing upstream conversational continuity to keep loops progressing from goals saved on disk. This is a fresh start, not full-history replay. Preserve existing verified replay first. Otherwise retire the exact unavailable durable owner only for originally unanchored, portable, self-contained input. Strip upstream session headers, exclude that owner, and retain specific alias fencing. Explicit anchors, files and opaque state do not qualify. No new setting: the existing request-path retirement already implements this policy; this patch bounds it and clears obsolete retry state.
+
+Capture circuit epoch/count/admission generation and quarantine generation before guarded retirement. After replacement acquisition clear only the captured episode and quarantine; newer failures remain authoritative. No broad alias mutation beyond the existing matched durable owner claim, no scheduler changes.

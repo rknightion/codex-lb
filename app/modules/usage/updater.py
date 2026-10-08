@@ -792,6 +792,11 @@ class UsageUpdater:
             snapshot_windows,
         )
         usage_written = any(_usage_entry_written(entry) for entry in entries)
+        usable_credits = credits_unlimited is True or (
+            credits_has is True and (credits_balance is None or credits_balance > 0)
+        )
+        if not usable_credits:
+            await self._reconcile_exhausted_reset(account, windows=(primary, secondary, monthly), now_epoch=now_epoch)
         await self._recover_quota_status_from_usage(account, primary=primary, secondary=secondary, monthly=monthly)
         return AccountRefreshResult(usage_written=usage_written)
 
@@ -872,6 +877,70 @@ class UsageUpdater:
         )
         return True
 
+    async def _reconcile_exhausted_reset(
+        self,
+        account: Account,
+        *,
+        windows: tuple[UsageWindow | None, UsageWindow | None, UsageWindow | None],
+        now_epoch: int,
+    ) -> None:
+        if not self._auth_manager or account.status not in (AccountStatus.RATE_LIMITED, AccountStatus.QUOTA_EXCEEDED):
+            return
+        deadlines = [
+            deadline
+            for window in windows
+            if window is not None and _window_is_exhausted(window)
+            if (deadline := _reset_at(window.reset_at, window.reset_after_seconds, now_epoch)) is not None
+            if plausible_rate_limit_reset_at(deadline, now=now_epoch) is not None
+        ]
+        if not deadlines:
+            return
+        deadline = max(deadlines)
+        # An actual throttle may outlast the reported exhausted window. It is
+        # independent evidence and must retain its rate-limit recovery rules.
+        if (
+            account.status == AccountStatus.RATE_LIMITED
+            and account.reset_at is not None
+            and account.reset_at > deadline
+        ):
+            return
+        primary, secondary, monthly = windows
+        long_windows = (secondary, monthly)
+        if primary is not None and usage_core.is_weekly_window_minutes(_window_minutes(primary.limit_window_seconds)):
+            long_windows = (*long_windows, primary)
+        target_status = (
+            AccountStatus.QUOTA_EXCEEDED
+            if any(
+                window is not None
+                and _window_is_exhausted(window)
+                and plausible_rate_limit_reset_at(
+                    _reset_at(window.reset_at, window.reset_after_seconds, now_epoch), now=now_epoch
+                )
+                is not None
+                for window in long_windows
+            )
+            else AccountStatus.RATE_LIMITED
+        )
+        if account.status == target_status and account.reset_at == deadline:
+            return
+        repo = cast(AccountsRepositoryWithStatusComparePort, self._auth_manager._repo)
+        updated = await repo.update_status_if_current(
+            account.id,
+            target_status,
+            account.deactivation_reason,
+            deadline,
+            blocked_at=account.blocked_at,
+            expected_status=account.status,
+            expected_deactivation_reason=account.deactivation_reason,
+            expected_reset_at=account.reset_at,
+            expected_blocked_at=account.blocked_at,
+        )
+        if updated:
+            account.status = target_status
+            account.reset_at = deadline
+        else:
+            await self._sync_account_from_repo(account)
+
     async def _recover_quota_status_from_usage(
         self,
         account: Account,
@@ -880,6 +949,14 @@ class UsageUpdater:
         secondary: UsageWindow | None,
         monthly: UsageWindow | None = None,
     ) -> None:
+        # Upstream can report the weekly window in the primary slot. Recover
+        # against its duration, as selection already does, not its slot name.
+        if (
+            primary is not None
+            and secondary is None
+            and usage_core.is_weekly_window_minutes(_window_minutes(primary.limit_window_seconds))
+        ):
+            secondary, primary = primary, None
         if not self._auth_manager:
             return
         if account.status == AccountStatus.RATE_LIMITED:
@@ -901,7 +978,14 @@ class UsageUpdater:
                 if now < cooldown_deadline:
                     return
             long_window = monthly or secondary
-            if primary is None and monthly is None:
+            if (
+                primary is None
+                and monthly is None
+                and not (
+                    secondary is not None
+                    and usage_core.is_weekly_window_minutes(_window_minutes(secondary.limit_window_seconds))
+                )
+            ):
                 return
             if primary is not None and not _window_has_available_quota(primary):
                 return

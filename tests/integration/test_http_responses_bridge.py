@@ -8827,19 +8827,30 @@ async def test_v1_responses_http_bridge_resumes_a_thread_whose_owner_was_retired
     assert [row.continuity_abandoned_at for row in rows if row.account_id == owner_account.id] == []
 
 
+@pytest.mark.parametrize(
+    ("owner_status", "reset_offset", "explicit_anchor", "newer_episode", "expected_status"),
+    [
+        (AccountStatus.PAUSED, None, False, False, 200),
+        (AccountStatus.QUOTA_EXCEEDED, 604800, False, False, 200),
+        (AccountStatus.RATE_LIMITED, 1, False, False, 502),
+        (AccountStatus.QUOTA_EXCEEDED, None, False, False, 502),
+        (AccountStatus.PAUSED, None, True, False, 400),
+        (AccountStatus.PAUSED, None, False, True, 404),
+    ],
+)
 @pytest.mark.asyncio
-async def test_v1_responses_http_bridge_rebinds_immediately_when_the_owner_cannot_return(
+async def test_v1_responses_http_bridge_fresh_starts_portable_input_when_the_owner_cannot_return(
     async_client,
     app_instance,
     monkeypatch,
     caplog,
+    owner_status,
+    reset_offset,
+    expected_status,
+    explicit_anchor,
+    newer_episode,
 ):
-    """#1707 without the wait: the first resume after the owner dies must serve.
-
-    The scheduled sweep frees a dormant thread six hours after its last turn.
-    That is too late for the turn a user is actually waiting on, so the connect
-    failure retires the owner in place and rebinds within the same request.
-    """
+    """An authorized portable fresh start releases a long-unavailable owner."""
     _install_bridge_settings(monkeypatch, enabled=True)
     owner_account_id = await _import_account(
         async_client,
@@ -8925,11 +8936,48 @@ async def test_v1_responses_http_bridge_rebinds_immediately_when_the_owner_canno
     async with service._http_bridge_lock:
         service._http_bridge_sessions.clear()
 
-    # The owner is paused. No grace elapses and no sweep runs.
+    # No grace elapses and no sweep runs. Only durable long outages require action.
     async with SessionLocal() as session:
-        await session.execute(update(Account).where(Account.id == owner_account.id).values(status=AccountStatus.PAUSED))
+        await session.execute(
+            update(Account)
+            .where(Account.id == owner_account.id)
+            .values(
+                status=owner_status,
+                reset_at=None if reset_offset is None else int(time.time()) + reset_offset,
+            )
+        )
         await session.commit()
 
+    if expected_status == 200 or newer_episode:
+        await service._durable_bridge.persist_retry_circuit(
+            session_key_kind=owned[0].session_key_kind,
+            session_key_value=owned[0].session_key_value,
+            api_key_id=None,
+            consecutive_failures=1,
+            cooldown_until_epoch=time.time() + 600,
+            last_detail="stream_incomplete",
+            updated_at_epoch=time.time(),
+        )
+    if newer_episode:
+        original_retire = service._durable_bridge.retire_continuity_owner_if_unavailable
+
+        async def retire_then_record_new_episode(**kwargs):
+            from app.db.models import HttpBridgeRetryCircuit
+            from app.modules.proxy.durable_bridge_repository import durable_bridge_hash
+
+            retired = await original_retire(**kwargs)
+            async with SessionLocal() as session:
+                await session.execute(
+                    update(HttpBridgeRetryCircuit)
+                    .where(HttpBridgeRetryCircuit.session_key_hash == durable_bridge_hash(owned[0].session_key_value))
+                    .values(consecutive_failures=2, updated_at_epoch=time.time() + 1)
+                )
+                await session.commit()
+            return retired
+
+        monkeypatch.setattr(
+            service._durable_bridge, "retire_continuity_owner_if_unavailable", retire_then_record_new_episode
+        )
     caplog.set_level(logging.INFO, logger="app.modules.proxy.service")
     second = await asyncio.wait_for(
         async_client.post(
@@ -8939,26 +8987,52 @@ async def test_v1_responses_http_bridge_rebinds_immediately_when_the_owner_canno
                 "model": "gpt-5.1",
                 "instructions": "Return exactly OK.",
                 "input": "continue",
+                **({"previous_response_id": owned[0].latest_response_id} if explicit_anchor else {}),
                 "prompt_cache_key": "http-bridge-instant-retire",
             },
         ),
         timeout=_TEST_SYNC_TIMEOUT_SECONDS,
     )
 
-    assert second.status_code == 200
-    assert served_account_ids[-1] == healthy_account.id
-    retired = [record.getMessage() for record in caplog.records if "owner_retired_on_request" in record.getMessage()]
-    assert len(retired) == 1
-    assert "outcome=rebind_without_anchor" in retired[0]
-
+    assert second.status_code == expected_status
+    if expected_status == 200:
+        assert served_account_ids == [owner_account.id, healthy_account.id]
+        assert any("owner_retired_on_request" in record.getMessage() for record in caplog.records)
+        sent = json.loads(upstream.sent_text[-1])
+        assert "previous_response_id" not in sent
+        third = await asyncio.wait_for(
+            async_client.post(
+                "/backend-api/codex/responses",
+                headers=thread_headers,
+                json={
+                    "model": "gpt-5.1",
+                    "instructions": "Return exactly OK.",
+                    "input": "continue after recovery",
+                    "prompt_cache_key": "http-bridge-instant-retire",
+                },
+            ),
+            timeout=_TEST_SYNC_TIMEOUT_SECONDS,
+        )
+        assert third.status_code == 200
+        assert owner_account.id not in served_account_ids[1:]
+    elif newer_episode:
+        assert second.json()["error"]["code"] == "bridge_previous_response_not_found"
+        assert len(upstream.sent_text) == 1
+        circuit = await service._durable_bridge.lookup_retry_circuit(
+            session_key_kind=owned[0].session_key_kind,
+            session_key_value=owned[0].session_key_value,
+            api_key_id=None,
+        )
+        assert circuit is not None and circuit.consecutive_failures >= 2
+    else:
+        assert second.json()["error"]["code"] == (
+            "continuity_recovery_required" if explicit_anchor else "previous_response_owner_unavailable"
+        )
+        assert served_account_ids == [owner_account.id]
     async with SessionLocal() as session:
         rows = list((await session.execute(select(HttpBridgeSessionRecord))).scalars().all())
-    # The rebind claimed the row for the replacement, and that claim clears the
-    # marker the retirement wrote — retirement is a step, not a resting state.
-    assert [row.account_id for row in rows if row.account_id == owner_account.id] == []
-    assert any(row.account_id == healthy_account.id for row in rows)
-    assert all(row.continuity_abandoned_at is None for row in rows)
-    assert all(row.continuity_abandonment_scope is None for row in rows)
+    expected_owner = healthy_account.id if expected_status == 200 or newer_episode else owner_account.id
+    assert any(row.account_id == expected_owner for row in rows)
 
 
 @pytest.mark.asyncio

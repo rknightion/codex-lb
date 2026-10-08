@@ -17881,8 +17881,8 @@ async def test_stream_via_http_bridge_fails_closed_when_previous_response_owner_
 
     get_or_create.assert_not_awaited()
     load_selection_inputs.assert_not_awaited()
-    assert exc_info.value.status_code == 502
-    assert exc_info.value.payload["error"]["code"] == "previous_response_owner_unavailable"
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.payload["error"]["code"] == "continuity_recovery_required"
 
 
 @pytest.mark.asyncio
@@ -28190,6 +28190,7 @@ async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_whe
     stored_model: str | None,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    monkeypatch.setattr(service._durable_bridge, "continuity_owner_requires_recovery", AsyncMock(return_value=False))
     account_neutral_classifier = Mock(
         wraps=http_bridge_streaming_module._http_bridge_payload_is_account_neutral_fresh_replay
     )
@@ -28464,8 +28465,8 @@ async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_whe
                 pass
 
         if unsafe_replay_input == "missing_owner":
-            assert exc_info.value.status_code == 502
-            assert exc_info.value.payload["error"]["code"] == "previous_response_owner_unavailable"
+            assert exc_info.value.status_code == 400
+            assert exc_info.value.payload["error"]["code"] == "continuity_recovery_required"
         else:
             assert exc_info.value is owner_unavailable
         assert get_or_create.await_count == (0 if unsafe_replay_input == "missing_owner" else 1)
@@ -31164,7 +31165,7 @@ async def test_http_bridge_reader_exception_captures_attempt_before_lifecycle_wa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transport", ["direct", "routed", "native"])
+@pytest.mark.parametrize("transport", ["direct", "routed", "native", "native_backpressure"])
 async def test_http_bridge_reader_maps_ordinary_websocket_receive_failure_to_stream_incomplete(
     monkeypatch: pytest.MonkeyPatch,
     transport: str,
@@ -31187,15 +31188,23 @@ async def test_http_bridge_reader_maps_ordinary_websocket_receive_failure_to_str
 
     class _NativeReceiveFailureWebSocket:
         async def receive(self) -> None:
-            raise NativeEgressTransportError("private upstream detail", failure_phase="transport")
+            raise NativeEgressTransportError(
+                "private upstream detail",
+                failure_phase="consumer_backpressure" if transport == "native_backpressure" else "transport",
+            )
 
     session = _make_bridge_session(key_value="bridge-ordinary-close")
+    if transport == "native_backpressure":
+        pending = _make_eventless_http_bridge_owner(request_id="req-local-overflow")
+        pending.response_event_count = 311
+        session.pending_requests.append(pending)
+        session.queued_request_count = 1
     session.upstream = (
         CodexUpstreamWebSocket(_RoutedReceiveFailureWebSocket())
         if transport == "routed"
         else WebsocketsUpstreamWebSocket(cast(Any, _OrdinaryCloseConnection()))
     )
-    if transport == "native":
+    if transport.startswith("native"):
         session.upstream = NativeUpstreamWebSocket(cast(Any, _NativeReceiveFailureWebSocket()))
     monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
     monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", AsyncMock(return_value=False))
@@ -31216,14 +31225,16 @@ async def test_http_bridge_reader_maps_ordinary_websocket_receive_failure_to_str
 
     assert session.last_upstream_close_code == (1011 if transport == "direct" else None)
     assert len(failure_calls) == 1
-    assert failure_calls[0]["error_code"] == "stream_incomplete"
-    assert failure_calls[0]["response_events_seen"] == 0
+    assert failure_calls[0]["error_code"] == (
+        "native_websocket_backpressure" if transport == "native_backpressure" else "stream_incomplete"
+    )
+    assert failure_calls[0]["response_events_seen"] == (311 if transport == "native_backpressure" else 0)
     if transport != "direct":
         # Intentional flip for issue #1754: an abrupt drop with no close frame
         # and zero response events must stay account-neutral instead of
         # feeding error backoff and stranding continuity-bound follow-ups.
         assert failure_calls[0]["penalize_account"] is False
-        assert failure_calls[0]["account_neutral_transport_drop"] is True
+        assert failure_calls[0]["account_neutral_transport_drop"] is (transport != "native_backpressure")
         assert failure_calls[0]["upstream_close_code"] is None
         assert failure_calls[0]["transport_classification"] == "websocket_transport_error"
     else:
@@ -31234,7 +31245,7 @@ async def test_http_bridge_reader_maps_ordinary_websocket_receive_failure_to_str
         assert failure_calls[0]["upstream_close_code"] == 1011
         assert failure_calls[0]["transport_classification"] == "websocket_close_transient"
 
-    if transport == "native":
+    if transport.startswith("native"):
         assert isinstance(session.upstream, NativeUpstreamWebSocket)
         assert failure_calls[0]["diagnostic_connection_id"] == session.upstream.diagnostic_connection_id
     else:

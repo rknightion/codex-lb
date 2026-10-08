@@ -130,6 +130,7 @@ from app.modules.proxy._service.http_bridge.quarantine import (
     _http_bridge_quarantine_clear_fence,
     _http_bridge_session_key_poison_quarantined,
     _http_bridge_session_key_quarantined,
+    _revoke_http_bridge_poison_quarantine,
 )
 from app.modules.proxy._service.http_bridge.retry_circuit import (
     _HTTP_BRIDGE_RETRY_CIRCUIT_ANCHOR_ABANDONED_DETAIL,
@@ -305,8 +306,21 @@ _HTTP_BRIDGE_CONTINUITY_OWNER_ERROR_CODES = frozenset(
     {
         "previous_response_owner_unavailable",
         "continuity_owner_conflict",
+        "continuity_recovery_required",
     }
 )
+
+
+def _http_bridge_continuity_recovery_required_error() -> ProxyResponseError:
+    return ProxyResponseError(
+        400,
+        openai_error(
+            "continuity_recovery_required",
+            "Conversation continuity cannot be recovered safely on another account. "
+            "Resend the complete conversation history in a new session, or wait for the original owner to recover.",
+            error_type="invalid_request_error",
+        ),
+    )
 
 
 def _durable_full_resend_anchor_rejection(
@@ -2090,6 +2104,8 @@ class _HTTPBridgeStreamingMixin:
         model_transition_owner_conflict_fork_attempted = False
         unanchored_fork_spill_attempted = False
         owner_retirement_attempted = False
+        owner_retirement_circuit_episode: tuple[float, int, int] | None = None
+        owner_retirement_quarantine_generation: int | None = None
         verified_stale_anchor_generation_captured = False
         verified_stale_anchor_circuit_key: _HTTPBridgeSessionKey | None = None
         verified_stale_anchor_generation: tuple[int, float, int, float, int, float, float] | None = None
@@ -2246,7 +2262,12 @@ class _HTTPBridgeStreamingMixin:
             return True
 
         async def retire_unavailable_continuity_owner(exc: ProxyResponseError) -> bool:
-            """Retire an owner that cannot return in time, so this turn can rebind.
+            """Restart portable input after a long-unavailable owner is retired.
+
+            This intentionally starts a new conversation when full-history
+            replay failed. The operator-approved retirement policy permits
+            that loss for proxy-owned anchors, never explicit client anchors
+            or account-scoped request state.
 
             The scheduled sweep frees a thread six hours after its last turn.
             That is right for a dormant thread but not for the one a user is
@@ -2260,6 +2281,15 @@ class _HTTPBridgeStreamingMixin:
             this account, and dropping it here would silently change what the
             client asked for.
             """
+            nonlocal owner_retirement_circuit_episode
+            nonlocal owner_retirement_quarantine_generation
+            nonlocal session_creation_headers
+            nonlocal dead_owner_anchor
+            nonlocal proxy_injected_previous_response_id
+            nonlocal file_required_preferred_account
+            nonlocal session_header_fallback_key
+            nonlocal incoming_turn_state_header
+            nonlocal force_local_recovery_creation
             nonlocal durable_lookup
             nonlocal effective_payload
             nonlocal owner_retirement_attempted
@@ -2281,6 +2311,20 @@ class _HTTPBridgeStreamingMixin:
                 return False
             if durable_lookup.account_id != retiring_account_id:
                 return False
+            if not await self._durable_bridge.continuity_owner_requires_recovery(
+                account_id=retiring_account_id,
+                recovery_deadline_epoch=int(clock.time() + max(0.0, request_deadline - clock.monotonic())),
+            ):
+                return False
+            fresh_payload = _http_bridge_payload_without_previous_response_id(untrimmed_effective_payload)
+            if not _http_bridge_payload_is_account_neutral_fresh_replay(fresh_payload):
+                return False
+            # Capture before retirement. A later episode or admission claim
+            # belongs to concurrent work and must not be cleared by this reset.
+            captured, generation = await self._http_bridge_retry_circuit_generation_for_key(bridge_session_key)
+            if not captured:
+                return False
+            owner_retirement_quarantine_generation = _http_bridge_quarantine_clear_fence(self, bridge_session_key)
             owner_retirement_attempted = True
             retired = await self._durable_bridge.retire_continuity_owner_if_unavailable(
                 session_id=durable_lookup.session_id,
@@ -2307,12 +2351,24 @@ class _HTTPBridgeStreamingMixin:
             # Send the body the client actually sent, minus the anchor only the
             # retired owner could resolve. ``untrimmed_effective_payload`` is
             # the pre-trim copy the other anchor-free retries already use.
-            effective_payload = _http_bridge_payload_without_previous_response_id(untrimmed_effective_payload)
+            owner_retirement_circuit_episode = (
+                (generation[1], generation[2], generation[0]) if generation is not None else None
+            )
+            fresh_replay_excluded_account_ids.add(retiring_account_id)
+            session_creation_headers = without_http_bridge_session_affinity_headers(session_creation_headers)
+            session_header_fallback_key = None
+            incoming_turn_state_header = None
+            force_local_recovery_creation = True
+            dead_owner_anchor = False
+            proxy_injected_previous_response_id = False
+            file_required_preferred_account = False
+            effective_payload = fresh_payload
             request_state, text_data = prepare_bridge_request(effective_payload)
             request_state.enforce_openai_sdk_contract = enforce_openai_sdk_contract
             request_state.affinity_policy = affinity
             request_state.transport = _REQUEST_TRANSPORT_HTTP
             request_state.preferred_account_id = None
+            request_state.excluded_account_ids.update(fresh_replay_excluded_account_ids)
             if downstream_turn_state is not None:
                 request_state.session_id = _normalize_session_id(downstream_turn_state)
             preferred_account_has_continuity_provenance = False
@@ -2457,13 +2513,7 @@ class _HTTPBridgeStreamingMixin:
             switch_to_account_neutral_replay()
 
         if required_continuity_owner_missing:
-            owner_unavailable = ProxyResponseError(
-                502,
-                openai_error(
-                    "previous_response_owner_unavailable",
-                    "Previous response owner account is unavailable; retry later.",
-                ),
-            )
+            owner_unavailable = _http_bridge_continuity_recovery_required_error()
             _record_continuity_fail_closed(
                 surface="http_bridge",
                 reason="owner_account_unavailable",
@@ -2547,6 +2597,15 @@ class _HTTPBridgeStreamingMixin:
                 if not owner_unavailable_allows_account_neutral_replay(exc):
                     if await retire_unavailable_continuity_owner(exc):
                         continue
+                    if (
+                        _http_bridge_is_previous_response_owner_unavailable(exc)
+                        and request_state.preferred_account_id is not None
+                        and await self._durable_bridge.continuity_owner_requires_recovery(
+                            account_id=request_state.preferred_account_id,
+                            recovery_deadline_epoch=int(clock.time() + max(0.0, request_deadline - clock.monotonic())),
+                        )
+                    ):
+                        raise _http_bridge_continuity_recovery_required_error() from exc
                     exc_code, _exc_message = _proxy_error_code_message(exc)
                     if not unanchored_fork_spill_attempted and _http_bridge_unanchored_fork_can_spill_on_cap(
                         error_code=exc_code,
@@ -3060,6 +3119,16 @@ class _HTTPBridgeStreamingMixin:
                             session.last_used_at = clock.monotonic()
                 return
         session = session_or_forward
+        if owner_retirement_circuit_episode is not None:
+            retired_episode_cleared = await self._clear_http_bridge_retry_circuit(
+                session,
+                settled_detail_authoritative=True,
+                expected_episode=owner_retirement_circuit_episode,
+            )
+            if retired_episode_cleared and owner_retirement_quarantine_generation is not None:
+                _revoke_http_bridge_poison_quarantine(
+                    self, session.key, generation=owner_retirement_quarantine_generation
+                )
         if (
             # A quarantine-suppressed anchor (#1534) must not be rehydrated
             # into the session either: doing so would let the session-level

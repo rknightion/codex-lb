@@ -328,3 +328,7 @@ File operations follow the existing pre-visible unary retry policy. The file cli
 For example, an unpinned upload whose account A cannot connect to its proxy can complete through account B, and the resulting file owner pin belongs to B. Finalization of a file pinned to A remains on A. Ambiguous request delivery, body-read failures, and host-wide network failures do not permit cross-account retries.
 
 Finalization may issue several upstream polls within one downstream call. A refused connection on its first poll can still use an eligible fallback account. After a poll has returned `retry` from A, however, a later refused connection must fail the operation on A: the pre-dispatch status of the later request does not undo the earlier poll's account-local progress. This applies even when no file owner pin was found; direct transport polling retains its existing behavior.
+
+## Operator-accepted fresh starts on unavailable owners
+
+The local Camden troubleshooting policy permits a new upstream conversation when a long-unavailable account owns an injected anchor and the current request body is portable. Complete verified replay remains preferred. The fallback intentionally loses earlier upstream context; loop goals on disk are the operator's recovery source, not something codex-lb reads. Explicit client anchors and file ownership retain their safety constraints. Captured circuit and quarantine generations permit clearing only the obsolete failure episode, and the canonical replacement binding supports later turns without changing shared sibling aliases.

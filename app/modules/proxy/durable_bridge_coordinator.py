@@ -1032,6 +1032,13 @@ class DurableBridgeSessionCoordinator:
                 request_fingerprint=request_fingerprint,
             )
 
+    async def continuity_owner_requires_recovery(self, *, account_id: str, recovery_deadline_epoch: int) -> bool:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).continuity_owner_requires_recovery(
+                account_id=account_id,
+                recovery_deadline_epoch=recovery_deadline_epoch,
+            )
+
     async def retire_continuity_owner_if_unavailable(
         self,
         *,

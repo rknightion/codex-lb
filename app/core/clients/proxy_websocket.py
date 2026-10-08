@@ -98,6 +98,7 @@ REALTIME_LIVE_CALL_ID_ROUTE_REGEX = (
 )
 _LIVE_CALL_ID_PATTERN = re.compile(rf"{REALTIME_LIVE_CALL_ID_ROUTE_REGEX}\Z")
 UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE = "upstream_websocket_liveness_timeout"
+NATIVE_WEBSOCKET_BACKPRESSURE_CODE = "native_websocket_backpressure"
 _WEBSOCKETS_KEEPALIVE_TIMEOUT_REASON = "keepalive ping timeout"
 _AIOHTTP_HEARTBEAT_TIMEOUT_PREFIX = "No PONG received after "
 
@@ -235,6 +236,7 @@ def is_account_neutral_websocket_error_code(error_code: str | None) -> bool:
     return error_code in {
         PROCESS_NETWORK_UNAVAILABLE_CODE,
         UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE,
+        NATIVE_WEBSOCKET_BACKPRESSURE_CODE,
         "upstream_keepalive_timeout",
     }
 
@@ -605,6 +607,11 @@ def _native_websocket_transport_error(
     operation: str,
 ) -> UpstreamWebSocketTransportError:
     phase = exc.failure_phase if isinstance(exc, NativeEgressTransportError) else "protocol"
+    if phase == "consumer_backpressure":
+        return UpstreamWebSocketTransportError(
+            f"Upstream websocket {operation} failed",
+            error_code=NATIVE_WEBSOCKET_BACKPRESSURE_CODE,
+        )
     if phase == "liveness_timeout":
         return UpstreamWebSocketTransportError(
             f"Upstream websocket {operation} failed",

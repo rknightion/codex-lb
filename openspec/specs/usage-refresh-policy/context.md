@@ -129,3 +129,7 @@ does not count as evidence that the account is healthy.
 
 - [#676 - initial bug report on `/wham/usage` vs. Settings UI divergence](https://github.com/Soju06/codex-lb/issues/676)
 - [#677 - dashboard per-account force-probe action](https://github.com/Soju06/codex-lb/issues/677)
+
+## Exhausted window reset reconciliation
+
+Fresh standard-window exhaustion must not leave an account repeatedly waiting on a short 429 cooldown. Reconciliation is conditional on the observed persisted markers, respects usable credits and genuine later throttle deadlines, and recognizes weekly windows in the primary slot. Stale rejection writers preserve newer status evidence. Camden exposed this as 100% weekly usage with a rolling seconds-away reset; the two horizons have different meanings.

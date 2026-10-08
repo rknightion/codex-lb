@@ -32,6 +32,7 @@ from app.core.balancer import (
     handle_quota_exceeded,
     handle_rate_limit,
     plausible_rate_limit_reset_at,
+    preserve_blocked_deadline,
 )
 from app.core.balancer import (
     select_account as select_account,
@@ -1712,21 +1713,29 @@ class LoadBalancer:
     async def mark_rate_limit(self, account: Account, error: UpstreamError) -> None:
         lock = await self._get_account_lock(account.id)
         async with lock:
+            previous_state = self._state_for(account)
             state = self._state_for(account)
             handle_rate_limit(state, error)
+            preserve_blocked_deadline(state, status=account.status, reset_at=account.reset_at, now=self._clock.time())
             self._sync_runtime_state(account, state)
             async with self._repo_factory() as repos:
-                await self._persist_state(repos.accounts, account, state)
+                persisted = await self._persist_state_if_current(repos.accounts, account, state)
+            if not persisted:
+                self._sync_runtime_state(account, previous_state)
             self._selection_inputs_cache.invalidate()
 
     async def mark_quota_exceeded(self, account: Account, error: UpstreamError) -> None:
         lock = await self._get_account_lock(account.id)
         async with lock:
+            previous_state = self._state_for(account)
             state = self._state_for(account)
             handle_quota_exceeded(state, error)
+            preserve_blocked_deadline(state, status=account.status, reset_at=account.reset_at, now=self._clock.time())
             self._sync_runtime_state(account, state)
             async with self._repo_factory() as repos:
-                await self._persist_state(repos.accounts, account, state)
+                persisted = await self._persist_state_if_current(repos.accounts, account, state)
+            if not persisted:
+                self._sync_runtime_state(account, previous_state)
             self._selection_inputs_cache.invalidate()
 
     async def mark_permanent_failure(self, account: Account, error_code: str) -> bool:

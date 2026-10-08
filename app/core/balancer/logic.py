@@ -1412,6 +1412,18 @@ def _format_retry_hint(wait_seconds: float) -> str:
     return f"Rate limit exceeded. Try again in {capped:.0f}s"
 
 
+def preserve_blocked_deadline(state: AccountState, *, status: AccountStatus, reset_at: int | None, now: float) -> None:
+    """Keep a known blocked horizon when a later error supplies a short cooldown."""
+    if status not in (AccountStatus.RATE_LIMITED, AccountStatus.QUOTA_EXCEEDED):
+        return
+    deadline = plausible_rate_limit_reset_at(reset_at, now=now)
+    if deadline is None:
+        return
+    if status == AccountStatus.QUOTA_EXCEEDED:
+        state.status = AccountStatus.QUOTA_EXCEEDED
+    state.reset_at = max(state.reset_at or deadline, deadline)
+
+
 def handle_quota_exceeded(state: AccountState, error: UpstreamError) -> None:
     now = time.time()
     state.status = AccountStatus.QUOTA_EXCEEDED

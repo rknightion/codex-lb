@@ -1437,11 +1437,16 @@ async def test_interpreted_sse_rejects_invalid_metadata_without_replay(
 
 
 @pytest.mark.asyncio
-async def test_native_websocket_overflow_logs_queue_snapshot(tmp_path: Path, caplog) -> None:
+@pytest.mark.parametrize("bound", ["count", "bytes"])
+async def test_native_websocket_overflow_logs_queue_snapshot(tmp_path: Path, caplog, monkeypatch, bound) -> None:
+    if bound == "count":
+        monkeypatch.setattr(native_egress_module, "_NATIVE_WEBSOCKET_MESSAGE_QUEUE_LIMIT", 64)
+    else:
+        monkeypatch.setattr(native_egress_module, "_NATIVE_WEBSOCKET_MESSAGE_QUEUE_BYTES_LIMIT", 640, raising=False)
     from app.core.clients.proxy_websocket import NativeUpstreamWebSocket
     from app.core.metrics.prometheus import REGISTRY
 
-    labels = {"queue": "websocket_messages", "limit": "count"}
+    labels = {"queue": "websocket_messages", "limit": bound}
     metric = "codex_lb_native_queue_overflows_total"
     before = (REGISTRY.get_sample_value(metric, labels) or 0) if REGISTRY is not None else None
     helper = tmp_path / "native-helper"
@@ -1477,14 +1482,15 @@ for line in sys.stdin:
         with caplog.at_level("WARNING"):
             result = await adapter.receive()
         assert result.kind == "error"
+        assert result.error_code == "native_websocket_backpressure"
         assert result.diagnostic_connection_id == adapter.diagnostic_connection_id
         message = next(record.message for record in caplog.records if "native_websocket_terminal" in record.message)
         for field in [
             "queue_name=websocket_messages",
             "queue_count=64",
-            "queue_count_limit=64",
+            f"queue_count_limit={64 if bound == 'count' else 4096}",
             "queue_bytes=640",
-            "queue_byte_limit=None",
+            f"queue_byte_limit={33554432 if bound == 'count' else 640}",
             "queue_rejected_bytes=10",
             "queue_projected_bytes=650",
             "queue_enqueued=64",
@@ -1499,3 +1505,40 @@ for line in sys.stdin:
             assert REGISTRY.get_sample_value(metric, labels) == before + 1
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_native_websocket_subprocess_small_burst_reaches_consumer(tmp_path: Path) -> None:
+    helper = tmp_path / "native-helper"
+    _write_helper(
+        helper,
+        """#!/usr/bin/env python3
+import json
+import sys
+for line in sys.stdin:
+    command = json.loads(line)
+    rid = command["request_id"]
+    if command["type"] == "websocket_connect":
+        events = [{"type": "websocket_open", "request_id": rid, "status": 101, "headers": []}]
+        events += [{"type": "websocket_text", "request_id": rid, "text": str(i)} for i in range(512)]
+        events += [{"type": "websocket_close", "request_id": rid, "code": 1000, "reason": ""}]
+        sys.stdout.write("\\n".join(json.dumps(e) for e in events) + "\\n")
+        sys.stdout.flush()
+    elif command["type"] == "cancel":
+        print(json.dumps({"type": "cancelled", "request_id": rid}), flush=True)
+""",
+    )
+    client = SubprocessNativeEgressClient(helper)
+    try:
+        socket = await client.websocket(
+            NativeWebSocketRequest(
+                url="wss://example.test/responses", headers={}, connect_timeout_seconds=2, max_message_bytes=1024
+            )
+        )
+        # A temporarily unscheduled consumer must tolerate a small complete burst.
+        await asyncio.wait_for(asyncio.shield(socket._pump_task), timeout=2)
+        actual = [(await socket.receive()).text for _ in range(512)]
+        assert actual == [str(i) for i in range(512)]
+        assert (await socket.receive()).kind == "close"
+    finally:
+        await asyncio.wait_for(client.aclose(), timeout=3)

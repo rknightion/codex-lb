@@ -4376,3 +4376,27 @@ async def test_api_key_enforced_priority_tier_still_routes_a_model_without_prior
     assert selection.error_code is None
     assert selection.account is not None
     assert selection.account.id == account.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["mark_rate_limit", "mark_quota_exceeded"])
+@pytest.mark.parametrize("stale", [False, True])
+async def test_transient_failure_preserves_exhausted_reset(method, stale):
+    account = _make_account("quota-horizon")
+    account.status = AccountStatus.QUOTA_EXCEEDED
+    deadline = int(time.time()) + 7 * 86400
+    account.reset_at = deadline
+    account.blocked_at = int(time.time()) - 60
+    stored = _make_account(account.id)
+    stored.status = account.status
+    stored.reset_at = account.reset_at
+    stored.blocked_at = account.blocked_at
+    if stale:
+        account.reset_at = int(time.time()) + 30
+    repo = StubAccountsRepository([stored])
+    balancer = LoadBalancer(
+        lambda: _repo_factory(repo, StubUsageRepository(primary={}, secondary={}), StubStickySessionsRepository())
+    )
+    await getattr(balancer, method)(account, {"message": "too many requests"})
+    assert stored.reset_at == deadline
+    assert stored.status == AccountStatus.QUOTA_EXCEEDED

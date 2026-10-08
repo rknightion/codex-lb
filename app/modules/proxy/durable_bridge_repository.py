@@ -24,6 +24,7 @@ from app.db.models import (
     HTTP_BRIDGE_TERMINAL_APPEND_PHASE_PENDING,
     HTTP_BRIDGE_TERMINAL_APPEND_PHASE_SETTLED,
     Account,
+    AccountStatus,
     HttpBridgeOperationEvent,
     HttpBridgeOperationEventChunk,
     HttpBridgeOperationRecord,
@@ -3567,6 +3568,24 @@ class DurableBridgeRepository:
                 )
                 await self._session.commit()
             deleted_count += len(deleted.scalars().all())
+
+    async def continuity_owner_requires_recovery(self, *, account_id: str, recovery_deadline_epoch: int) -> bool:
+        """Observe a long-unavailable owner without discarding continuity proof.
+
+        Called only after typed required-owner selection failed. Unknown reset
+        times and reauthentication warnings alone do not prove a long outage.
+        """
+        result = await self._session.execute(select(Account.status, Account.reset_at).where(Account.id == account_id))
+        owner = result.one_or_none()
+        if owner is None:
+            return True
+        if owner.status in {AccountStatus.PAUSED, AccountStatus.DEACTIVATED}:
+            return True
+        return (
+            owner.status in {AccountStatus.RATE_LIMITED, AccountStatus.QUOTA_EXCEEDED}
+            and owner.reset_at is not None
+            and owner.reset_at >= recovery_deadline_epoch
+        )
 
     async def retire_continuity_owner_if_unavailable(
         self,
