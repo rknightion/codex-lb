@@ -98,6 +98,7 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_payload_looks_like_full_resend,
     _http_bridge_payload_without_previous_response_id,
     _http_bridge_previous_response_error_envelope,
+    _http_bridge_prompt_cache_waits_on_create_cap,
     _http_bridge_request_budget_seconds,
     _http_bridge_request_needs_unanchored_handoff,
     _http_bridge_request_stage,
@@ -4695,7 +4696,9 @@ class _HTTPBridgeStreamingMixin:
                     lifecycle.settlement_owned = True
                 _signal_propagated_responses_service_cleanup_ready()
             except ProxyResponseError as exc:
-                if request_state.bridge_soft_capacity_reroute_allowed:
+                if request_state.bridge_soft_capacity_reroute_allowed and not (
+                    _http_bridge_prompt_cache_waits_on_create_cap(exc, key=session.key)
+                ):
                     raise
                 wait_plan = _http_bridge_capacity_wait_plan(
                     exc, request_deadline=request_deadline, now=clock.monotonic()
