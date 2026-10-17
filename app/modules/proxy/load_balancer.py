@@ -4,7 +4,7 @@ import asyncio
 import inspect
 import json
 import logging
-from collections.abc import Collection, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Iterable
@@ -1713,25 +1713,19 @@ class LoadBalancer:
     _restore_sticky_mutation = staticmethod(_restore_sticky_mutation)
 
     async def mark_rate_limit(self, account: Account, error: UpstreamError) -> None:
-        lock = await self._get_account_lock(account.id)
-        async with lock:
-            previous_state = self._state_for(account)
-            state = self._state_for(account)
-            handle_rate_limit(state, error)
-            preserve_blocked_deadline(state, status=account.status, reset_at=account.reset_at, now=self._clock.time())
-            self._sync_runtime_state(account, state)
-            async with self._repo_factory() as repos:
-                persisted = await self._persist_state_if_current(repos.accounts, account, state)
-            if not persisted:
-                self._sync_runtime_state(account, previous_state)
-            self._selection_inputs_cache.invalidate()
+        await self._mark_blocked(account, error, handle_rate_limit)
 
     async def mark_quota_exceeded(self, account: Account, error: UpstreamError) -> None:
+        await self._mark_blocked(account, error, handle_quota_exceeded)
+
+    async def _mark_blocked(
+        self, account: Account, error: UpstreamError, handler: Callable[[AccountState, UpstreamError], None]
+    ) -> None:
         lock = await self._get_account_lock(account.id)
         async with lock:
             previous_state = self._state_for(account)
             state = self._state_for(account)
-            handle_quota_exceeded(state, error)
+            handler(state, error)
             preserve_blocked_deadline(state, status=account.status, reset_at=account.reset_at, now=self._clock.time())
             self._sync_runtime_state(account, state)
             async with self._repo_factory() as repos:
