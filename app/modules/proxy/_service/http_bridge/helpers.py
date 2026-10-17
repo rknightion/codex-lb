@@ -3533,6 +3533,26 @@ def _http_bridge_is_previous_response_owner_unavailable(exc: ProxyResponseError)
     return error.get("code") == "previous_response_owner_unavailable"
 
 
+def _http_bridge_prompt_cache_waits_on_create_cap(
+    exc: ProxyResponseError,
+    *,
+    key: "_HTTPBridgeSessionKey",
+) -> bool:
+    """True when a prompt_cache bridge should wait out the account create cap.
+
+    The cap is account-wide, so a reroute bridge would land on the same
+    account, open a cold upstream websocket and forfeit the prompt cache while
+    still waiting for the same capacity. The warm bridge keeps the cache.
+    """
+    if exc.status_code != 429 or key.affinity_kind != "prompt_cache":
+        return False
+    payload = exc.payload
+    if not isinstance(payload, dict):
+        return False
+    error = payload.get("error")
+    return isinstance(error, dict) and error.get("code") == "account_response_create_cap"
+
+
 def _http_bridge_should_attempt_soft_affinity_reroute(
     exc: ProxyResponseError,
     *,
@@ -3542,6 +3562,8 @@ def _http_bridge_should_attempt_soft_affinity_reroute(
     if exc.status_code != 429:
         return False
     if key.strength == "hard" or previous_response_id is not None:
+        return False
+    if _http_bridge_prompt_cache_waits_on_create_cap(exc, key=key):
         return False
     payload = exc.payload
     if not isinstance(payload, dict):
@@ -3942,6 +3964,7 @@ for _helper_name in (
     "_http_bridge_should_attempt_local_previous_response_recovery",
     "_http_bridge_is_explicit_previous_response_rejection",
     "_http_bridge_is_previous_response_owner_unavailable",
+    "_http_bridge_prompt_cache_waits_on_create_cap",
     "_http_bridge_should_attempt_soft_affinity_reroute",
     "_http_bridge_is_context_overflow_error",
     "_http_bridge_should_rollover_after_context_overflow",

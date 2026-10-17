@@ -4774,7 +4774,7 @@ async def test_http_bridge_submit_gate_contention_still_reroutes_soft_sessions(
 async def test_http_bridge_submit_leaves_soft_capacity_for_session_reroute(monkeypatch: pytest.MonkeyPatch) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     session = _make_bridge_session(key_value="soft-submit-capacity")
-    session.key = proxy_service._HTTPBridgeSessionKey("prompt_cache", "soft-submit-capacity", None)
+    session.key = proxy_service._HTTPBridgeSessionKey("request", "soft-submit-capacity", None)
     request_state = proxy_service._WebSocketRequestState(
         request_id="req-soft-submit-capacity",
         model="gpt-5.4",
@@ -4809,6 +4809,178 @@ async def test_http_bridge_submit_leaves_soft_capacity_for_session_reroute(monke
 
     assert exc_info.value is capacity_error
     assert submit.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_submit_prompt_cache_waits_on_create_cap_instead_of_rerouting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    session = _make_bridge_session(key_value="prompt-cache-create-cap")
+    session.key = proxy_service._HTTPBridgeSessionKey("prompt_cache", "prompt-cache-create-cap", None)
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-prompt-cache-create-cap",
+        model="gpt-5.4",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=99.5,
+        transport="http",
+        event_queue=asyncio.Queue(),
+        bridge_soft_capacity_reroute_allowed=True,
+    )
+    capacity_error = ProxyResponseError(
+        429,
+        openai_error(
+            "account_response_create_cap",
+            "Account response-create concurrency limit reached",
+            error_type="rate_limit_error",
+        ),
+    )
+    submit_calls = 0
+    clock = VirtualClock(monotonic_value=100.0)
+    service._clock = clock
+
+    async def submit(_session: Any, *, request_state: Any, **_kwargs: Any) -> None:
+        nonlocal submit_calls
+        submit_calls += 1
+        if submit_calls == 1:
+            raise capacity_error
+        await request_state.event_queue.put(None)
+
+    async def fake_capacity_wait(**kwargs: object):
+        clock.advance(cast(float, kwargs["sleep_seconds"]))
+        if False:
+            yield ""
+
+    monkeypatch.setattr(service, "_submit_http_bridge_request", submit)
+    monkeypatch.setattr(http_bridge_streaming_module, "_http_bridge_account_capacity_wait_seconds", lambda _exc: 0.001)
+    monkeypatch.setattr(http_bridge_streaming_module, "_iter_account_capacity_wait_sse", fake_capacity_wait)
+
+    async for _ in service._stream_http_bridge_session_events(
+        session,
+        request_state=request_state,
+        text_data='{"type":"response.create"}',
+        queue_limit=4,
+        propagate_http_errors=True,
+        downstream_turn_state=None,
+        request_deadline=101.0,
+    ):
+        pass
+
+    assert submit_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_stream_via_http_bridge_soft_prompt_cache_create_cap_does_not_reroute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    payload = proxy_service.ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.4",
+            "instructions": "hi",
+            "input": "hello",
+            "prompt_cache_key": "soft-create-cap",
+        }
+    )
+    warm_session = _make_bridge_session(key_value="soft-create-cap")
+    warm_session.key = proxy_service._HTTPBridgeSessionKey("prompt_cache", "soft-create-cap", None)
+    get_or_create = AsyncMock(side_effect=[warm_session])
+    cap_error = ProxyResponseError(
+        429,
+        proxy_service.openai_error(
+            "account_response_create_cap",
+            "Account response-create concurrency limit reached",
+            error_type="rate_limit_error",
+        ),
+    )
+
+    async def fake_stream_events(
+        session: proxy_service._HTTPBridgeSession,
+        *,
+        request_state: proxy_service._WebSocketRequestState,
+        text_data: str,
+        queue_limit: int,
+        propagate_http_errors: bool,
+        downstream_turn_state: str | None,
+        request_deadline: float | None = None,
+    ):
+        del session, request_state, text_data, queue_limit, propagate_http_errors, downstream_turn_state
+        del request_deadline
+        raise cap_error
+        yield ""
+
+    monkeypatch.setattr(
+        proxy_service,
+        "get_settings_cache",
+        lambda: cast(
+            Any,
+            SimpleNamespace(
+                get=AsyncMock(
+                    return_value=SimpleNamespace(
+                        sticky_threads_enabled=False,
+                        openai_cache_affinity_max_age_seconds=1800,
+                        http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
+                        http_responses_session_bridge_gateway_safe_mode=False,
+                    )
+                )
+            ),
+        ),
+    )
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    monkeypatch.setattr(service._durable_bridge, "lookup_request_targets", AsyncMock(return_value=None))
+    monkeypatch.setattr(service, "_resolve_file_account_for_responses", AsyncMock(return_value=None))
+    monkeypatch.setattr(service, "_get_or_create_http_bridge_session", get_or_create)
+    monkeypatch.setattr(service, "_stream_http_bridge_session_events", fake_stream_events)
+
+    with pytest.raises(ProxyResponseError) as exc_info:
+        async for _ in service._stream_via_http_bridge(
+            payload,
+            headers={},
+            codex_session_affinity=False,
+            propagate_http_errors=True,
+            openai_cache_affinity=True,
+            api_key=None,
+            api_key_reservation=None,
+            suppress_text_done_events=False,
+            idle_ttl_seconds=120.0,
+            codex_idle_ttl_seconds=1800.0,
+            max_sessions=8,
+            queue_limit=4,
+        ):
+            pass
+
+    assert exc_info.value is cap_error
+    # No reroute bridge: the cold session would reuse the same account's cap.
+    assert get_or_create.await_count == 1
+
+
+@pytest.mark.parametrize(
+    ("affinity_kind", "error_code", "expected"),
+    [
+        ("prompt_cache", "account_response_create_cap", False),
+        ("prompt_cache", "bridge_queue_full", True),
+        ("prompt_cache", "response_create_gate_timeout", True),
+        ("prompt_cache", "account_stream_cap", True),
+        ("request", "account_response_create_cap", True),
+    ],
+)
+def test_http_bridge_soft_reroute_keeps_prompt_cache_bridge_on_create_cap(
+    affinity_kind: str, error_code: str, expected: bool
+) -> None:
+    exc = ProxyResponseError(
+        429,
+        openai_error(error_code, "capacity", error_type="rate_limit_error"),
+    )
+    key = proxy_service._HTTPBridgeSessionKey(affinity_kind, "k", None, strength="soft")
+
+    assert (
+        http_bridge_helpers_module._http_bridge_should_attempt_soft_affinity_reroute(
+            exc, key=key, previous_response_id=None
+        )
+        is expected
+    )
 
 
 @pytest.mark.asyncio
